@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Generated images
+*.png
+
+# Generated Excel/PDF output
+*.xlsx
+*_temp.pdf
+
+# Test PDFs (downloaded)
+test_pdfs/
+
+# Claude Code
+.claude/
+
+# Temporary
+*.tmp

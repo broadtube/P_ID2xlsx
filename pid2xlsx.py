@@ -9,7 +9,9 @@ import sys
 import zipfile
 import shutil
 import tempfile
+import math
 from pathlib import Path
+from collections import Counter
 from xml.etree.ElementTree import Element, SubElement, tostring, register_namespace
 
 import fitz  # PyMuPDF
@@ -40,9 +42,286 @@ COL_WIDTH_EMU = 161925
 # 7.5pt × 12700 = 95250 EMU
 ROW_HEIGHT_EMU = 95250
 
+# --- 用紙サイズ定義 (名前, openpyxl定数, 幅inch, 高さinch) ---
+PAPER_SIZES = [
+    ('A4', 9, 8.27, 11.69),
+    ('A3', 8, 11.69, 16.54),
+    ('Letter', 1, 8.5, 11.0),
+    ('Tabloid', 3, 11.0, 17.0),
+    ('A2', None, 16.54, 23.39),
+    ('A1', None, 23.39, 33.11),
+    ('A0', None, 33.11, 46.81),
+    ('ANSI_B', 3, 11.0, 17.0),
+    ('ANSI_C', None, 17.0, 22.0),
+    ('ANSI_D', None, 22.0, 34.0),
+    ('ANSI_E', None, 34.0, 44.0),
+]
+
+
+# PDFフォント名 → Excel互換フォント名マッピング
+_FONT_NAME_MAP = {
+    'ArialMT': 'Arial',
+    'Arial-BoldMT': 'Arial',
+    'Arial-ItalicMT': 'Arial',
+    'Arial-BoldItalicMT': 'Arial',
+    'Arial,Bold': 'Arial',
+    'Arial,BoldItalic': 'Arial',
+    'Arial,Italic': 'Arial',
+    'Helvetica': 'Arial',
+    'Helvetica-Bold': 'Arial',
+    'Helvetica-Oblique': 'Arial',
+    'TimesNewRomanPSMT': 'Times New Roman',
+    'TimesNewRomanPS-BoldMT': 'Times New Roman',
+    'TimesNewRomanPS-ItalicMT': 'Times New Roman',
+    'TimesNewRomanPS-BoldItalicMT': 'Times New Roman',
+    'TimesNewRoman,Bold': 'Times New Roman',
+    'Times-Roman': 'Times New Roman',
+    'Times-Bold': 'Times New Roman',
+    'CourierNewPSMT': 'Courier New',
+    'Courier': 'Courier New',
+    'Calibri': 'Calibri',
+    'Calibri,Bold': 'Calibri',
+    'Calibri-Bold': 'Calibri',
+    'Tahoma': 'Tahoma',
+    'Tahoma-Bold': 'Tahoma',
+}
+
+
+def _map_font_name(pdf_font_name: str) -> str:
+    """PDFフォント名をExcel互換のフォント名にマッピング"""
+    if pdf_font_name in _FONT_NAME_MAP:
+        return _FONT_NAME_MAP[pdf_font_name]
+    # サブセット接頭辞を除去 (e.g., 'ABCDEF+ArialMT' → 'ArialMT')
+    if '+' in pdf_font_name:
+        base = pdf_font_name.split('+', 1)[1]
+        if base in _FONT_NAME_MAP:
+            return _FONT_NAME_MAP[base]
+    # コンマ区切りのスタイル指定を除去 (e.g., 'Arial,Bold' → 'Arial')
+    base = pdf_font_name.split(',')[0]
+    # ハイフン区切りのスタイルを除去 (e.g., 'Arial-BoldMT' → 'Arial')
+    for suffix in ['-BoldMT', '-ItalicMT', '-BoldItalicMT', 'MT',
+                   '-Bold', '-Italic', '-BoldItalic', '-Oblique',
+                   '-Regular', '-Light', '-Medium', 'PS']:
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    return base or 'Arial'
+
+
+def _classify_dash_pattern(dashes: str, line_width: float = 1.0) -> str:
+    """PDF破線パターン文字列をExcelプリセットダッシュに変換
+
+    PDF dashes format: "[ dash_len gap_len ... ]" or "[]" for solid
+    Excel presets: solid, dot, dash, lgDash, dashDot, lgDashDot, lgDashDotDot,
+                   sysDash, sysDot, sysDashDot, sysDashDotDot
+    """
+    if not dashes or dashes == '[]':
+        return 'solid'
+
+    # "[ 1.5 2.0 ]" → [1.5, 2.0]
+    try:
+        values = [float(v) for v in dashes.strip('[] ').split()]
+    except (ValueError, AttributeError):
+        return 'solid'
+
+    if not values:
+        return 'solid'
+
+    # 線幅で正規化（パターンを線幅比で分類）
+    w = max(line_width, 0.5)
+    normalized = [v / w for v in values]
+
+    n = len(normalized)
+    if n == 0:
+        return 'solid'
+
+    # 2要素: [dash, gap]
+    if n == 2:
+        dash_ratio = normalized[0]
+        if dash_ratio < 1.5:
+            return 'sysDot'      # 短い点
+        elif dash_ratio < 4:
+            return 'sysDash'     # 短いダッシュ
+        elif dash_ratio < 8:
+            return 'dash'        # 通常ダッシュ
+        else:
+            return 'lgDash'      # 長いダッシュ
+
+    # 4要素: [dash, gap, dot, gap] → dashDot
+    if n == 4:
+        if normalized[2] < 2:
+            return 'dashDot'
+        else:
+            return 'lgDashDot'
+
+    # 6要素: [dash, gap, dot, gap, dot, gap] → lgDashDotDot
+    if n >= 6:
+        return 'lgDashDotDot'
+
+    # その他: 最初の要素で分類
+    if normalized[0] < 2:
+        return 'dot'
+    else:
+        return 'dash'
+
+
+def _classify_line_cap(cap_value) -> str | None:
+    """PDF lineCap値 → Excel cap属性
+
+    PDF: 0=butt, 1=round, 2=projecting square
+    Excel: flat, rnd, sq
+
+    Note: round cap (1) はbutt capとほぼ同じため設定しない。
+    projecting square (2) のみ視覚的に異なるため設定する。
+    """
+    if cap_value == 2:
+        return 'sq'
+    return None  # 0(butt) and 1(round) = Excelデフォルトで十分
+
+
+def _classify_line_join(join_value) -> str | None:
+    """PDF lineJoin値 → Excel join要素
+
+    PDF: 0=miter, 1=round, 2=bevel
+    """
+    if join_value == 1:
+        return 'round'
+    elif join_value == 2:
+        return 'bevel'
+    return None  # 0(miter) = Excelデフォルト
+
 
 def pdf_pt_to_emu(pt: float) -> int:
     return int(pt * PDF_TO_EMU)
+
+
+def detect_paper_size(page):
+    """ページの表示寸法から最適な用紙サイズを自動検出
+    Returns: (paper_name, openpyxl_paper_code, is_landscape)
+    """
+    # 表示空間の寸法（回転考慮後）
+    w_pt = page.rect.width
+    h_pt = page.rect.height
+    w_in = w_pt / 72
+    h_in = h_pt / 72
+
+    # 横向きかどうか
+    is_landscape = w_in > h_in
+
+    # 正規化（短辺x長辺）
+    short = min(w_in, h_in)
+    long = max(w_in, h_in)
+
+    best_match = None
+    best_dist = float('inf')
+
+    for name, code, pw, ph in PAPER_SIZES:
+        ps = min(pw, ph)
+        pl = max(pw, ph)
+        dist = abs(short - ps) + abs(long - pl)
+        if dist < best_dist:
+            best_dist = dist
+            best_match = (name, code, is_landscape)
+
+    # 3インチ以上のずれがあればカスタムサイズ
+    if best_dist > 3.0:
+        return ('Custom', None, is_landscape)
+
+    return best_match
+
+
+def analyze_page_content(page):
+    """ページのテキストとドローイングの特性を分析し、
+    テキストアウトライン化の有無を検出する。
+
+    Returns: dict with keys:
+        text_span_count: int
+        drawing_count: int
+        text_outline_detected: bool
+        text_outline_threshold: float  (テキストアウトラインと判定する最大パスサイズ)
+        page_diag: float  (ページ対角線の長さ pt)
+    """
+    # テキストスパン数
+    text_dict = page.get_text('dict')
+    text_spans = 0
+    for block in text_dict.get('blocks', []):
+        if block['type'] == 0:
+            for line in block.get('lines', []):
+                for span in line.get('spans', []):
+                    if span['text'].strip():
+                        text_spans += 1
+
+    drawings = page.get_drawings()
+    draw_count = len(drawings)
+
+    # ページ対角線長
+    w = page.rect.width
+    h = page.rect.height
+    page_diag = math.sqrt(w * w + h * h)
+
+    # テキストアウトライン検出ヒューリスティック:
+    # 1. 小さい閉じたベジェ曲線パスが多数ある
+    # 2. テキストスパンが少ない（または描画数に対して異常に少ない）
+    #
+    # テキストアウトラインの特徴:
+    # - パスサイズが文字サイズ程度（通常 < ページ対角線の1.5%）
+    # - closePath=True
+    # - ベジェ曲線を含む
+    # - 同じ色が多い（文字色）
+
+    # 閾値: ページ対角線の1.5%（典型的なフォントサイズに対応）
+    outline_threshold = page_diag * 0.015
+
+    small_closed_curves = 0
+    for d in drawings:
+        items = d['items']
+        rect = d['rect']
+        max_dim = max(rect.x1 - rect.x0, rect.y1 - rect.y0)
+        has_curves = any(i[0] == 'c' for i in items)
+        if has_curves and max_dim < outline_threshold and d.get('closePath', False):
+            small_closed_curves += 1
+
+    # テキストアウトラインと判定:
+    # - 小さい閉じた曲線パスが全描画の20%以上、かつ
+    # - テキストスパンが少ない（描画数の10%未満）or 小さい閉じた曲線が100個以上
+    text_outline_detected = False
+    if draw_count > 0:
+        curve_ratio = small_closed_curves / draw_count
+        text_ratio = text_spans / max(draw_count, 1)
+        if (small_closed_curves > 100 or curve_ratio > 0.2) and text_ratio < 0.1:
+            text_outline_detected = True
+        elif small_closed_curves > 500:
+            # 絶対数が非常に多い場合は無条件で検出
+            text_outline_detected = True
+
+    return {
+        'text_span_count': text_spans,
+        'drawing_count': draw_count,
+        'text_outline_detected': text_outline_detected,
+        'text_outline_threshold': outline_threshold,
+        'small_closed_curves': small_closed_curves,
+        'page_diag': page_diag,
+    }
+
+
+def _is_text_outline_path(drawing, threshold):
+    """描画パスがテキストアウトライン（文字の輪郭）かどうか判定
+
+    テキストアウトラインの特徴:
+    - 小さい（< threshold）
+    - 閉じたパス
+    - ベジェ曲線を含む
+    """
+    items = drawing['items']
+    rect = drawing['rect']
+    max_dim = max(rect.x1 - rect.x0, rect.y1 - rect.y0)
+    if max_dim >= threshold:
+        return False
+    if not drawing.get('closePath', False):
+        return False
+    if any(i[0] == 'c' for i in items):
+        return True
+    return False
 
 
 def make_coord_transform(page):
@@ -246,7 +525,8 @@ def make_shape_xml(shape_id: int, name: str, prst: str,
                    fill_color: str = None, text: str = None,
                    font_size: float = None, no_line: bool = False,
                    path_items: list = None, closePath: bool = False,
-                   text_rotation: int = 0, shape_rot: int = 0) -> Element:
+                   text_rotation: int = 0, shape_rot: int = 0,
+                   **kwargs) -> Element:
     """TwoCellAnchor + Shape XML要素を生成"""
     anchor = Element(f'{{{NS_XDR}}}twoCellAnchor')
 
@@ -331,6 +611,21 @@ def make_shape_xml(shape_id: int, name: str, prst: str,
         sf = SubElement(ln, f'{{{NS_A}}}solidFill')
         srgb = SubElement(sf, f'{{{NS_A}}}srgbClr')
         srgb.set('val', line_color)
+        # 破線パターン
+        dash_preset = kwargs.get('dash_preset')
+        if dash_preset and dash_preset != 'solid':
+            prstDash = SubElement(ln, f'{{{NS_A}}}prstDash')
+            prstDash.set('val', dash_preset)
+        # 線端形状
+        line_cap = kwargs.get('line_cap')
+        if line_cap:
+            ln.set('cap', line_cap)
+        # 線結合
+        line_join = kwargs.get('line_join')
+        if line_join == 'round':
+            SubElement(ln, f'{{{NS_A}}}round')
+        elif line_join == 'bevel':
+            SubElement(ln, f'{{{NS_A}}}bevel')
 
     # テキスト
     if text:
@@ -341,6 +636,7 @@ def make_shape_xml(shape_id: int, name: str, prst: str,
         body_pr.set('tIns', '0')
         body_pr.set('rIns', '0')
         body_pr.set('bIns', '0')
+        body_pr.set('anchor', 't')  # テキストを上揃え（デフォルトの中央揃えによるずれを防止）
         # テキスト回転
         if text_rotation == 90:
             body_pr.set('vert', 'vert')  # 90° CW (top to bottom)
@@ -348,16 +644,33 @@ def make_shape_xml(shape_id: int, name: str, prst: str,
             body_pr.set('vert', 'vert270')  # 270° CW (bottom to top)
         SubElement(tx_body, f'{{{NS_A}}}lstStyle')
         p = SubElement(tx_body, f'{{{NS_A}}}p')
+        # 行間を100%に設定（Excelデフォルトの120%行間による上部パディングを排除）
+        pPr = SubElement(p, f'{{{NS_A}}}pPr')
+        lnSpc = SubElement(pPr, f'{{{NS_A}}}lnSpc')
+        spcPts = SubElement(lnSpc, f'{{{NS_A}}}spcPts')
+        spcPts.set('val', str(int((font_size or 6.0) * 100)))
+        spcBef = SubElement(pPr, f'{{{NS_A}}}spcBef')
+        SubElement(spcBef, f'{{{NS_A}}}spcPts').set('val', '0')
+        spcAft = SubElement(pPr, f'{{{NS_A}}}spcAft')
+        SubElement(spcAft, f'{{{NS_A}}}spcPts').set('val', '0')
         r = SubElement(p, f'{{{NS_A}}}r')
         rp = SubElement(r, f'{{{NS_A}}}rPr')
         rp.set('lang', 'en-US')
         sz = int((font_size or 6.0) * 100)
         rp.set('sz', str(sz))
+        # ボールド/イタリック
+        font_flags = kwargs.get('font_flags', 0)
+        if font_flags & 0x10:  # Bold
+            rp.set('b', '1')
+        if font_flags & 0x02:  # Italic
+            rp.set('i', '1')
         solid = SubElement(rp, f'{{{NS_A}}}solidFill')
         srgb = SubElement(solid, f'{{{NS_A}}}srgbClr')
         srgb.set('val', line_color)
         latin = SubElement(rp, f'{{{NS_A}}}latin')
-        latin.set('typeface', 'Arial')
+        # PDFフォント名 → Excel互換フォント名にマッピング
+        font_name = kwargs.get('font_name', 'Arial')
+        latin.set('typeface', _map_font_name(font_name))
         t = SubElement(r, f'{{{NS_A}}}t')
         t.text = text
 
@@ -390,7 +703,6 @@ def _triangle_rotation(tpts):
     """三角形の3頂点から、頂点(apex)が指す方向に応じたExcel回転値を返す。
     Excelのtriangleプリセットはデフォルトで頂点が上を向く。
     回転値: 0=上, 5400000=右, 10800000=下, 16200000=左"""
-    import math
     # 最長辺（底辺）を見つけ、その対頂点がapex
     edges = []
     for i in range(3):
@@ -428,7 +740,6 @@ def _homeplate_rotation(tpts):
     xs = [p[0] for p in tpts]
     ys = [p[1] for p in tpts]
     # 各座標値の出現頻度を調べる
-    from collections import Counter
     x_counts = Counter(round(x, 0) for x in xs)
     y_counts = Counter(round(y, 0) for y in ys)
     # ホームベースの特徴: 矩形の4隅のうち2つが同じx（またはy）を共有し、
@@ -461,7 +772,6 @@ def _homeplate_rotation(tpts):
     cy = sum(p[1] for p in tpts) / 5
     dx = tip[0] - cx
     dy = tip[1] - cy
-    import math
     angle = math.degrees(math.atan2(dy, dx))
     # Excel homePlate: 尖端が右=0°
     # angle: 0=右, 90=下, -90=上, 180=左
@@ -475,16 +785,29 @@ def _homeplate_rotation(tpts):
         return 10800000
 
 
-def _is_valve_pattern(items, rect):
+def _is_valve_pattern(items, rect, page_diag=None):
     """3直線がバルブ（ボウタイ/X型）パターンかどうか判定
-    条件: 3直線、4端点、適切なサイズ、少なくとも2本が対角線"""
+    条件: 3直線、4端点、適切なサイズ、少なくとも2本が対角線
+
+    page_diag: ページ対角線長（pt）。指定時は閾値をページサイズに対して相対化。
+    """
     line_items = [i for i in items if i[0] == 'l']
     if len(line_items) != 3 or len(items) != 3:
         return False
 
     mw = rect.x1 - rect.x0
     mh = rect.y1 - rect.y0
-    if min(mw, mh) <= 5 or max(mw, mh) >= 30:
+
+    # サイズ閾値: ページ対角線に対する相対値
+    # デフォルト: 元のテストPDF (diag≈1458pt) → min_size=5, max_size=30
+    if page_diag and page_diag > 0:
+        min_size = page_diag * 0.003   # ~0.3% of diagonal
+        max_size = page_diag * 0.025   # ~2.5% of diagonal
+    else:
+        min_size = 5
+        max_size = 30
+
+    if min(mw, mh) <= min_size or max(mw, mh) >= max_size:
         return False
     if max(mw, mh) / max(min(mw, mh), 0.1) >= 2.5:
         return False
@@ -529,8 +852,11 @@ def transform_items(items, transform):
     return new_items
 
 
-def classify_drawing(drawing: dict, transform=None) -> dict | None:
-    """PDF描画パスを分類し、図形情報を返す"""
+def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | None:
+    """PDF描画パスを分類し、図形情報を返す
+
+    page_diag: ページ対角線長（pt）。図形サイズ判定の閾値に使用。
+    """
     items = drawing['items']
     rect = drawing['rect']
     color = drawing.get('color', (0, 0, 0))
@@ -543,7 +869,14 @@ def classify_drawing(drawing: dict, transform=None) -> dict | None:
 
     line_color = color_tuple_to_hex(color) or '000000'
     fill_color = color_tuple_to_hex(fill)
-    line_width_emu = max(int(width * PDF_TO_EMU), 3175)  # 最小0.25pt
+    width_pt = width or 1.0
+    line_width_emu = max(int(width_pt * PDF_TO_EMU), 3175)  # 最小0.25pt
+
+    # 破線・線端・結合スタイル
+    dashes = drawing.get('dashes', '')
+    dash_preset = _classify_dash_pattern(dashes, width_pt)
+    line_cap = _classify_line_cap(drawing.get('lineCap', 0))
+    line_join = _classify_line_join(drawing.get('lineJoin', 0))
 
     # 座標変換
     if transform:
@@ -556,7 +889,8 @@ def classify_drawing(drawing: dict, transform=None) -> dict | None:
         x1, y1, x2, y2 = rect.x0, rect.y0, rect.x1, rect.y1
 
     base = dict(x1=x1, y1=y1, x2=x2, y2=y2,
-                line_color=line_color, fill_color=fill_color, line_width=line_width_emu)
+                line_color=line_color, fill_color=fill_color, line_width=line_width_emu,
+                dash_preset=dash_preset, line_cap=line_cap, line_join=line_join)
 
     # 矩形
     if any(i[0] in ('re', 'qu') for i in items):
@@ -588,7 +922,7 @@ def classify_drawing(drawing: dict, transform=None) -> dict | None:
 
         # バルブ検出: 3直線でボウタイ（X型）を形成
         # 向きはmake_valve_geom(vertical)で制御（display bboxの縦横比で判定）
-        if _is_valve_pattern(items, rect):
+        if _is_valve_pattern(items, rect, page_diag=page_diag):
             return dict(type='valve', **base)
 
         # 三角形検出: 3直線、3頂点（バルブは4頂点なので除外済み）
@@ -651,7 +985,8 @@ def classify_drawing(drawing: dict, transform=None) -> dict | None:
             # 角度スナップ
             lx1, ly1, lx2, ly2 = _snap_line(lx1, ly1, lx2, ly2)
             return dict(type='line', x1=lx1, y1=ly1, x2=lx2, y2=ly2,
-                        line_color=line_color, fill_color=None, line_width=line_width_emu)
+                        line_color=line_color, fill_color=None, line_width=line_width_emu,
+                        dash_preset=dash_preset, line_cap=line_cap, line_join=line_join)
         # 複数直線 → 個別の線に分解（freeformのbbox丸め問題を回避）
         lines = []
         for li in line_items:
@@ -664,14 +999,14 @@ def classify_drawing(drawing: dict, transform=None) -> dict | None:
                 lx2, ly2 = p2.x, p2.y
             lx1, ly1, lx2, ly2 = _snap_line(lx1, ly1, lx2, ly2)
             lines.append(dict(type='line', x1=lx1, y1=ly1, x2=lx2, y2=ly2,
-                              line_color=line_color, fill_color=None, line_width=line_width_emu))
+                              line_color=line_color, fill_color=None, line_width=line_width_emu,
+                              dash_preset=dash_preset, line_cap=line_cap, line_join=line_join))
         return dict(type='multi_line', lines=lines)
 
     return None
 
 
 def extract_text_spans(page, transform=None) -> list:
-    import math
     rotation = page.rotation
     spans = []
     blocks = page.get_text('dict')['blocks']
@@ -684,17 +1019,64 @@ def extract_text_spans(page, transform=None) -> list:
                 text = span['text'].strip()
                 if not text:
                     continue
+
+                font_size = span['size']
+                font_name = span.get('font', 'Arial')
+                font_flags = span.get('flags', 0)
+
+                # origin（ベースライン座標）を使用して正確な位置を計算
+                origin = span.get('origin')
+                ascender = span.get('ascender', 0.905)  # ArialMTデフォルト
+                descender = span.get('descender', -0.212)
                 bbox = span['bbox']
-                if transform:
-                    tx1, ty1 = transform(bbox[0], bbox[1])
-                    tx2, ty2 = transform(bbox[2], bbox[3])
-                    sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
-                    sy1, sy2 = min(ty1, ty2), max(ty1, ty2)
+
+                if origin and abs(dir_[0]) > 0.5:
+                    # 水平テキスト: originのy座標からascent/descentを使って
+                    # テキストボックスの上下を計算
+                    ox, oy = origin
+                    top_y = oy - font_size * ascender
+                    bot_y = oy - font_size * descender  # descenderは負なので引く→加算
+                    # x方向はbboxを使用（origin.xは最初の文字の位置なので幅情報がない）
+                    if transform:
+                        tx1, ty_top = transform(bbox[0], top_y)
+                        tx2, ty_bot = transform(bbox[2], bot_y)
+                        sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
+                        sy1, sy2 = min(ty_top, ty_bot), max(ty_top, ty_bot)
+                    else:
+                        sx1 = bbox[0]
+                        sx2 = bbox[2]
+                        sy1 = top_y
+                        sy2 = bot_y
+                elif origin and abs(dir_[1]) > 0.5:
+                    # 垂直テキスト: originのx座標からascent/descentを使って計算
+                    ox, oy = origin
+                    if dir_[1] > 0:
+                        # dir=(0,1) → mediaboxで上向き
+                        left_x = ox - font_size * ascender
+                        right_x = ox - font_size * descender
+                    else:
+                        # dir=(0,-1)
+                        left_x = ox + font_size * descender
+                        right_x = ox + font_size * ascender
+                    if transform:
+                        tx1, ty1 = transform(left_x, bbox[1])
+                        tx2, ty2 = transform(right_x, bbox[3])
+                        sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
+                        sy1, sy2 = min(ty1, ty2), max(ty1, ty2)
+                    else:
+                        sx1, sy1 = left_x, bbox[1]
+                        sx2, sy2 = right_x, bbox[3]
                 else:
-                    sx1, sy1, sx2, sy2 = bbox[0], bbox[1], bbox[2], bbox[3]
+                    # フォールバック: bboxをそのまま使用
+                    if transform:
+                        tx1, ty1 = transform(bbox[0], bbox[1])
+                        tx2, ty2 = transform(bbox[2], bbox[3])
+                        sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
+                        sy1, sy2 = min(ty1, ty2), max(ty1, ty2)
+                    else:
+                        sx1, sy1, sx2, sy2 = bbox[0], bbox[1], bbox[2], bbox[3]
 
                 # テキスト回転角度（表示空間）
-                # 方向ベクトルをページ回転で変換
                 dx, dy = dir_
                 if rotation == 270:
                     ddx, ddy = dy, -dx
@@ -704,9 +1086,7 @@ def extract_text_spans(page, transform=None) -> list:
                     ddx, ddy = -dx, -dy
                 else:
                     ddx, ddy = dx, dy
-                # 表示空間での角度（度）
                 angle_deg = math.degrees(math.atan2(ddy, ddx))
-                # 0°に近い場合は回転なし
                 if abs(angle_deg) < 1:
                     text_rot = 0
                 else:
@@ -721,7 +1101,8 @@ def extract_text_spans(page, transform=None) -> list:
 
                 spans.append(dict(text=text, x1=sx1, y1=sy1,
                                   x2=sx2, y2=sy2,
-                                  size=span['size'], font=span['font'],
+                                  size=font_size, font=font_name,
+                                  font_flags=font_flags,
                                   rotation=text_rot, color=text_color))
     return spans
 
@@ -757,23 +1138,45 @@ def build_drawing_xml(page) -> tuple:
     rotation = page.rotation
     drawings = page.get_drawings()
 
+    # ページ分析: テキストアウトライン検出
+    analysis = analyze_page_content(page)
+    page_diag = analysis['page_diag']
+    text_outline_mode = analysis['text_outline_detected']
+    outline_threshold = analysis['text_outline_threshold']
+
+    if text_outline_mode:
+        print(f"  ⚠ テキストアウトライン検出: {analysis['small_closed_curves']}個の"
+              f"小さい閉じた曲線パスをフィルタリング")
+        print(f"    テキストスパン: {analysis['text_span_count']}、"
+              f"描画パス: {analysis['drawing_count']}")
+
+    # 小さい図形フィルタの閾値もページサイズに相対化
+    # デフォルト (diag≈1458pt) → 2pt ≈ 0.14%
+    min_shape_size = max(page_diag * 0.0014, 1.0)
+
     # Pass 1: バルブを検出してbounding box（mediabox座標）を記録
     valve_rects = []
     for d in drawings:
-        if _is_valve_pattern(d['items'], d['rect']):
+        if _is_valve_pattern(d['items'], d['rect'], page_diag=page_diag):
             rect = d['rect']
             valve_rects.append((rect.x0, rect.y0, rect.x1, rect.y1))
 
     shape_id = 2
     count = 0
+    skipped_outlines = 0
 
-    # Pass 2: 図形変換（バルブ辺の単一直線を抑制）
+    # Pass 2: 図形変換（バルブ辺の単一直線を抑制、テキストアウトラインをフィルタ）
     for d in drawings:
+        # テキストアウトラインモード: 小さい閉じた曲線パスを除外
+        if text_outline_mode and _is_text_outline_path(d, outline_threshold):
+            skipped_outlines += 1
+            continue
+
         # バルブの辺（三角形の一辺）を抑制
         if _is_valve_edge_line(d, valve_rects):
             continue
 
-        info = classify_drawing(d, transform)
+        info = classify_drawing(d, transform, page_diag=page_diag)
         if info is None:
             continue
 
@@ -789,6 +1192,9 @@ def build_drawing_xml(page) -> tuple:
                     line_width_emu=line_info['line_width'],
                     line_color=line_info['line_color'],
                     fill_color=None,
+                    dash_preset=line_info.get('dash_preset'),
+                    line_cap=line_info.get('line_cap'),
+                    line_join=line_info.get('line_join'),
                 )
                 root.append(elem)
                 shape_id += 1
@@ -797,7 +1203,7 @@ def build_drawing_xml(page) -> tuple:
 
         dx = abs(info['x2'] - info['x1'])
         dy = abs(info['y2'] - info['y1'])
-        if info['type'] not in ('line', 'freeform', 'dot') and dx < 2 and dy < 2:
+        if info['type'] not in ('line', 'freeform', 'dot') and dx < min_shape_size and dy < min_shape_size:
             continue
 
         # 図形タイプ → Excelプリセットジオメトリ
@@ -829,12 +1235,19 @@ def build_drawing_xml(page) -> tuple:
             path_items=path_items,
             closePath=closePath,
             shape_rot=info.get('shape_rot', 0),
+            dash_preset=info.get('dash_preset'),
+            line_cap=info.get('line_cap'),
+            line_join=info.get('line_join'),
         )
         root.append(elem)
         shape_id += 1
         count += 1
 
-    # テキスト
+    if skipped_outlines > 0:
+        print(f"  テキストアウトラインとして除外: {skipped_outlines}パス")
+
+    # テキスト（通常のテキスト抽出）
+    text_count = 0
     for span in extract_text_spans(page, transform):
         elem = make_shape_xml(
             shape_id=shape_id,
@@ -848,14 +1261,84 @@ def build_drawing_xml(page) -> tuple:
             font_size=span['size'],
             no_line=True,
             text_rotation=span.get('rotation', 0),
+            font_name=span.get('font', 'Arial'),
+            font_flags=span.get('font_flags', 0),
         )
         root.append(elem)
         shape_id += 1
         count += 1
+        text_count += 1
+
+    # テキストアウトラインモードでテキストが少ない場合: OCRフォールバック
+    if text_outline_mode and text_count < 10:
+        ocr_spans = _ocr_text_fallback(page, transform)
+        if ocr_spans:
+            print(f"  OCRフォールバック: {len(ocr_spans)}テキスト抽出")
+            for span in ocr_spans:
+                elem = make_shape_xml(
+                    shape_id=shape_id,
+                    name=f'ocr_text_{shape_id}',
+                    prst='rect',
+                    x1=span['x1'], y1=span['y1'],
+                    x2=span['x2'], y2=span['y2'],
+                    line_color=span.get('color', '000000'),
+                    fill_color=None,
+                    text=span['text'],
+                    font_size=span.get('size', 8.0),
+                    no_line=True,
+                    text_rotation=span.get('rotation', 0),
+                )
+                root.append(elem)
+                shape_id += 1
+                count += 1
 
     xml_bytes = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
     xml_bytes += tostring(root, encoding='unicode').encode('utf-8')
     return xml_bytes, count
+
+
+def _ocr_text_fallback(page, transform=None):
+    """テキストがアウトライン化されている場合のOCRフォールバック
+
+    PyMuPDFのOCR機能（Tesseract）を使用してテキストを抽出する。
+    Tesseractがインストールされていない場合は空リストを返す。
+    """
+    try:
+        # PyMuPDFのOCR: ページを画像化してTesseractで認識
+        # get_text with "ocr" parameter (requires Tesseract)
+        tp = page.get_textpage_ocr(flags=fitz.TEXT_PRESERVE_WHITESPACE, full=True)
+        blocks = page.get_text('dict', textpage=tp).get('blocks', [])
+
+        spans = []
+        for block in blocks:
+            if block['type'] != 0:
+                continue
+            for line in block.get('lines', []):
+                for span in line.get('spans', []):
+                    text = span['text'].strip()
+                    if not text:
+                        continue
+                    bbox = span['bbox']
+                    if transform:
+                        tx1, ty1 = transform(bbox[0], bbox[1])
+                        tx2, ty2 = transform(bbox[2], bbox[3])
+                        sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
+                        sy1, sy2 = min(ty1, ty2), max(ty1, ty2)
+                    else:
+                        sx1, sy1, sx2, sy2 = bbox
+
+                    spans.append(dict(
+                        text=text,
+                        x1=sx1, y1=sy1, x2=sx2, y2=sy2,
+                        size=span.get('size', 8.0),
+                        rotation=0,
+                        color='000000',
+                    ))
+        return spans
+
+    except Exception as e:
+        print(f"  OCR利用不可（Tesseractが必要）: {e}")
+        return []
 
 
 def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None):
@@ -884,16 +1367,25 @@ def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None):
         # グリッド線を非表示
         ws.sheet_view.showGridLines = False
 
-        # ページ設定（横向き、余白最小、1ページに収める）
-        ws.page_setup.orientation = 'landscape'
-        ws.page_setup.paperSize = ws.PAPERSIZE_TABLOID  # 11x17インチ
+        # 用紙サイズ自動検出
+        paper_name, paper_code, is_landscape = detect_paper_size(page)
+        print(f"  用紙サイズ: {paper_name} ({'横' if is_landscape else '縦'})")
+
+        # ページ設定（余白最小、1ページに収める）
+        ws.page_setup.orientation = 'landscape' if is_landscape else 'portrait'
+        # 用紙コード（openpyxl定数）
+        if paper_code is not None:
+            ws.page_setup.paperSize = paper_code
+        else:
+            # カスタムサイズの場合、最も近い大きな標準サイズを使用
+            ws.page_setup.paperSize = ws.PAPERSIZE_TABLOID
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 1
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_margins = PageMargins(left=0.1, right=0.1, top=0.1, bottom=0.1,
                                        header=0, footer=0)
 
-        # 細かいグリッド（PDF 1224x792pt → 96列x106行で十分）
+        # 細かいグリッド（ページサイズに応じて自動計算）
         num_cols = int(page.rect.width / 12.75) + 5
         num_rows = int(page.rect.height / 7.5) + 5
         for col_idx in range(1, num_cols + 1):
