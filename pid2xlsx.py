@@ -1596,14 +1596,11 @@ def main():
 
     args = parser.parse_args()
 
-    # PDF指定がない場合、カレントディレクトリの最初のPDFを使用
+    # PDF指定がない場合、ヘルプを表示
     pdf_path = args.pdf
     if not pdf_path:
-        pdf_files = list(Path('.').glob('*.pdf'))
-        if not pdf_files:
-            parser.print_help()
-            sys.exit(1)
-        pdf_path = str(pdf_files[0])
+        parser.print_help()
+        sys.exit(0)
 
     # オプションをdictに変換
     options = {
