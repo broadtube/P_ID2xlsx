@@ -111,16 +111,26 @@ def _map_font_name(pdf_font_name: str) -> str:
 def _classify_dash_pattern(dashes: str, line_width: float = 1.0) -> str:
     """PDF破線パターン文字列をExcelプリセットダッシュに変換
 
-    PDF dashes format: "[ dash_len gap_len ... ]" or "[]" for solid
+    PDF dashes format: "[ dash_len gap_len ... ] phase" or "[] 0" for solid
+    phase部分はオフセットで、dash配列が空なら実線。
     Excel presets: solid, dot, dash, lgDash, dashDot, lgDashDot, lgDashDotDot,
                    sysDash, sysDot, sysDashDot, sysDashDotDot
     """
-    if not dashes or dashes == '[]':
+    if not dashes:
         return 'solid'
 
-    # "[ 1.5 2.0 ]" → [1.5, 2.0]
+    # "[] 0" や "[]" → 空のdash配列 = 実線
+    # まず括弧の中身だけを取り出す
+    bracket_start = dashes.find('[')
+    bracket_end = dashes.find(']')
+    if bracket_start < 0 or bracket_end < 0:
+        return 'solid'
+    inner = dashes[bracket_start + 1:bracket_end].strip()
+    if not inner:
+        return 'solid'  # 空配列 = 実線
+
     try:
-        values = [float(v) for v in dashes.strip('[] ').split()]
+        values = [float(v) for v in inner.split()]
     except (ValueError, AttributeError):
         return 'solid'
 
@@ -171,24 +181,32 @@ def _classify_line_cap(cap_value) -> str | None:
     PDF: 0=butt, 1=round, 2=projecting square
     Excel: flat, rnd, sq
 
+    PyMuPDFはlineCapをタプル(start, end, ?)で返す場合がある。
     Note: round cap (1) はbutt capとほぼ同じため設定しない。
-    projecting square (2) のみ視覚的に異なるため設定する。
     """
-    if cap_value == 2:
+    # タプルの場合は最初の値を使用
+    if isinstance(cap_value, (tuple, list)):
+        cap_value = cap_value[0] if cap_value else 0
+    cap_int = int(round(cap_value)) if isinstance(cap_value, float) else (cap_value or 0)
+    if cap_int == 2:
         return 'sq'
-    return None  # 0(butt) and 1(round) = Excelデフォルトで十分
+    return None
 
 
 def _classify_line_join(join_value) -> str | None:
     """PDF lineJoin値 → Excel join要素
 
     PDF: 0=miter, 1=round, 2=bevel
+    PyMuPDFはfloat値を返す場合がある。
     """
-    if join_value == 1:
+    if join_value is None:
+        return None
+    join_int = int(round(join_value)) if isinstance(join_value, float) else join_value
+    if join_int == 1:
         return 'round'
-    elif join_value == 2:
+    elif join_int == 2:
         return 'bevel'
-    return None  # 0(miter) = Excelデフォルト
+    return None
 
 
 def pdf_pt_to_emu(pt: float) -> int:
@@ -1131,8 +1149,21 @@ def _is_valve_edge_line(drawing, valve_rects):
     return False
 
 
-def build_drawing_xml(page) -> tuple:
-    """ページからDrawing XMLを生成。(xml_bytes, shape_count) を返す"""
+def build_drawing_xml(page, options=None) -> tuple:
+    """ページからDrawing XMLを生成。(xml_bytes, shape_count) を返す
+
+    options: dict with optional keys:
+        no_text: bool - テキスト抽出を無効化
+        no_dots: bool - ゼロ長線（ドット）を無視
+        min_line_width: float - 最小線幅(pt)。これ未満の線を無視
+        max_shapes: int - 最大シェイプ数。超過時に停止
+        no_dashes: bool - 破線パターンを無効化（全て実線）
+        no_text_outline_filter: bool - テキストアウトラインフィルタを無効化
+        snap_threshold: float - 角度スナップ閾値(pt)
+    """
+    if options is None:
+        options = {}
+
     root = Element(f'{{{NS_XDR}}}wsDr')
     transform = make_coord_transform(page)
     rotation = page.rotation
@@ -1144,15 +1175,25 @@ def build_drawing_xml(page) -> tuple:
     text_outline_mode = analysis['text_outline_detected']
     outline_threshold = analysis['text_outline_threshold']
 
+    # オプションによるテキストアウトラインフィルタの無効化
+    if options.get('no_text_outline_filter'):
+        text_outline_mode = False
+
     if text_outline_mode:
-        print(f"  ⚠ テキストアウトライン検出: {analysis['small_closed_curves']}個の"
+        print(f"  WARNING: テキストアウトライン検出: {analysis['small_closed_curves']}個の"
               f"小さい閉じた曲線パスをフィルタリング")
         print(f"    テキストスパン: {analysis['text_span_count']}、"
               f"描画パス: {analysis['drawing_count']}")
 
     # 小さい図形フィルタの閾値もページサイズに相対化
-    # デフォルト (diag≈1458pt) → 2pt ≈ 0.14%
     min_shape_size = max(page_diag * 0.0014, 1.0)
+
+    # オプション: 最小線幅フィルタ
+    min_line_width_pt = options.get('min_line_width', 0)
+    min_line_width_emu = int(min_line_width_pt * PDF_TO_EMU) if min_line_width_pt > 0 else 0
+
+    # オプション: 最大シェイプ数
+    max_shapes = options.get('max_shapes', 0)
 
     # Pass 1: バルブを検出してbounding box（mediabox座標）を記録
     valve_rects = []
@@ -1167,6 +1208,11 @@ def build_drawing_xml(page) -> tuple:
 
     # Pass 2: 図形変換（バルブ辺の単一直線を抑制、テキストアウトラインをフィルタ）
     for d in drawings:
+        # 最大シェイプ数チェック
+        if max_shapes > 0 and count >= max_shapes:
+            print(f"  WARNING: 最大シェイプ数 {max_shapes} に到達、残りをスキップ")
+            break
+
         # テキストアウトラインモード: 小さい閉じた曲線パスを除外
         if text_outline_mode and _is_text_outline_path(d, outline_threshold):
             skipped_outlines += 1
@@ -1180,9 +1226,23 @@ def build_drawing_xml(page) -> tuple:
         if info is None:
             continue
 
+        # オプション: ドット（ゼロ長線）を無視
+        if options.get('no_dots') and info.get('type') == 'dot':
+            continue
+
+        # オプション: 最小線幅フィルタ
+        if min_line_width_emu > 0 and info.get('line_width', 0) < min_line_width_emu:
+            continue
+
+        # オプション: 破線を実線に強制
+        if options.get('no_dashes'):
+            info['dash_preset'] = 'solid'
+
         # 複数直線 → 個別の線として展開
         if info.get('type') == 'multi_line':
             for line_info in info['lines']:
+                if options.get('no_dashes'):
+                    line_info['dash_preset'] = 'solid'
                 elem = make_shape_xml(
                     shape_id=shape_id,
                     name=f'line_{shape_id}',
@@ -1246,9 +1306,10 @@ def build_drawing_xml(page) -> tuple:
     if skipped_outlines > 0:
         print(f"  テキストアウトラインとして除外: {skipped_outlines}パス")
 
-    # テキスト（通常のテキスト抽出）
+    # テキスト（通常のテキスト抽出）— no_textオプションで無効化可能
     text_count = 0
-    for span in extract_text_spans(page, transform):
+    text_spans = [] if options.get('no_text') else extract_text_spans(page, transform)
+    for span in text_spans:
         elem = make_shape_xml(
             shape_id=shape_id,
             name=f'text_{shape_id}',
@@ -1341,7 +1402,7 @@ def _ocr_text_fallback(page, transform=None):
         return []
 
 
-def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None):
+def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None, options: dict = None):
     """P&ID PDFをExcelに変換"""
     pdf_path = Path(pdf_path)
     if xlsx_path is None:
@@ -1402,7 +1463,7 @@ def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None):
         page = doc[page_idx]
         print(f"\nページ {page_idx + 1}/{doc_page_count} "
               f"(サイズ: {page.rect.width:.0f}x{page.rect.height:.0f} pt)")
-        xml_bytes, count = build_drawing_xml(page)
+        xml_bytes, count = build_drawing_xml(page, options=options)
         drawing_data.append((xml_bytes, count))
         print(f"  図形数: {count}")
 
@@ -1494,18 +1555,68 @@ def _inject_drawings_impl(xlsx_path: str, tmp_path: str, drawing_data: list):
 
 
 def main():
-    if len(sys.argv) < 2:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='P&ID PDF → Excel (.xlsx) 変換ツール',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用例:
+  python pid2xlsx.py input.pdf                    # 基本変換
+  python pid2xlsx.py input.pdf -o output.xlsx     # 出力先指定
+  python pid2xlsx.py input.pdf --no-text          # テキストなし（図形のみ）
+  python pid2xlsx.py input.pdf --no-dots          # ドット除去
+  python pid2xlsx.py input.pdf --max-shapes 5000  # シェイプ数制限
+  python pid2xlsx.py input.pdf --min-line-width 0.5  # 細い線を除去
+  python pid2xlsx.py input.pdf --no-dashes        # 破線を実線化
+  python pid2xlsx.py input.pdf --no-text-outline-filter  # テキストアウトラインフィルタ無効
+
+比較用に異なる設定で複数出力:
+  python pid2xlsx.py input.pdf -o out_default.xlsx
+  python pid2xlsx.py input.pdf -o out_no_dots.xlsx --no-dots
+  python pid2xlsx.py input.pdf -o out_no_text.xlsx --no-text
+""")
+
+    parser.add_argument('pdf', nargs='?', help='入力PDFファイル')
+    parser.add_argument('-o', '--output', help='出力xlsxファイル')
+    parser.add_argument('--no-text', action='store_true',
+                        help='テキスト抽出を無効化（図形のみ出力）')
+    parser.add_argument('--no-dots', action='store_true',
+                        help='ゼロ長線（ドットマーカー）を無視')
+    parser.add_argument('--no-dashes', action='store_true',
+                        help='破線パターンを無効化（全て実線で出力）')
+    parser.add_argument('--no-text-outline-filter', action='store_true',
+                        help='テキストアウトラインの自動フィルタリングを無効化')
+    parser.add_argument('--min-line-width', type=float, default=0,
+                        help='最小線幅(pt)。これ未満の線を無視（例: 0.5）')
+    parser.add_argument('--max-shapes', type=int, default=0,
+                        help='ページあたりの最大シェイプ数。超過時に停止')
+    parser.add_argument('--snap-threshold', type=float, default=1.5,
+                        help='角度スナップ閾値(pt)。水平/垂直のずれがこの値未満なら補正（デフォルト: 1.5）')
+
+    args = parser.parse_args()
+
+    # PDF指定がない場合、カレントディレクトリの最初のPDFを使用
+    pdf_path = args.pdf
+    if not pdf_path:
         pdf_files = list(Path('.').glob('*.pdf'))
         if not pdf_files:
-            print("使用法: python pid2xlsx.py <input.pdf> [output.xlsx]")
+            parser.print_help()
             sys.exit(1)
-        pdf_path = pdf_files[0]
-        xlsx_path = None
-    else:
-        pdf_path = sys.argv[1]
-        xlsx_path = sys.argv[2] if len(sys.argv) > 2 else None
+        pdf_path = str(pdf_files[0])
 
-    convert_pid_to_xlsx(pdf_path, xlsx_path)
+    # オプションをdictに変換
+    options = {
+        'no_text': args.no_text,
+        'no_dots': args.no_dots,
+        'no_dashes': args.no_dashes,
+        'no_text_outline_filter': args.no_text_outline_filter,
+        'min_line_width': args.min_line_width,
+        'max_shapes': args.max_shapes,
+        'snap_threshold': args.snap_threshold,
+    }
+
+    convert_pid_to_xlsx(pdf_path, args.output, options=options)
 
 
 if __name__ == '__main__':
