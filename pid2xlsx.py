@@ -1332,7 +1332,8 @@ def build_drawing_xml(page, options=None) -> tuple:
 
     # テキストアウトラインモードでテキストが少ない場合: OCRフォールバック
     if text_outline_mode and text_count < 10:
-        ocr_spans = _ocr_text_fallback(page, transform)
+        ocr_provider = options.get('ocr', 'auto')
+        ocr_spans = _ocr_text_fallback(page, transform, ocr_provider=ocr_provider)
         if ocr_spans:
             print(f"  OCRフォールバック: {len(ocr_spans)}テキスト抽出")
             for span in ocr_spans:
@@ -1358,48 +1359,151 @@ def build_drawing_xml(page, options=None) -> tuple:
     return xml_bytes, count
 
 
-def _ocr_text_fallback(page, transform=None):
+def _ocr_text_fallback(page, transform=None, ocr_provider='auto'):
     """テキストがアウトライン化されている場合のOCRフォールバック
 
-    PyMuPDFのOCR機能（Tesseract）を使用してテキストを抽出する。
-    Tesseractがインストールされていない場合は空リストを返す。
+    OCRプロバイダ優先順位:
+    1. easyocr (pip install easyocr)
+    2. Tesseract (PyMuPDF経由、要システムインストール)
+
+    ocr_provider: 'auto', 'easyocr', 'tesseract', 'none'
     """
-    try:
-        # PyMuPDFのOCR: ページを画像化してTesseractで認識
-        # get_text with "ocr" parameter (requires Tesseract)
-        tp = page.get_textpage_ocr(flags=fitz.TEXT_PRESERVE_WHITESPACE, full=True)
-        blocks = page.get_text('dict', textpage=tp).get('blocks', [])
-
-        spans = []
-        for block in blocks:
-            if block['type'] != 0:
-                continue
-            for line in block.get('lines', []):
-                for span in line.get('spans', []):
-                    text = span['text'].strip()
-                    if not text:
-                        continue
-                    bbox = span['bbox']
-                    if transform:
-                        tx1, ty1 = transform(bbox[0], bbox[1])
-                        tx2, ty2 = transform(bbox[2], bbox[3])
-                        sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
-                        sy1, sy2 = min(ty1, ty2), max(ty1, ty2)
-                    else:
-                        sx1, sy1, sx2, sy2 = bbox
-
-                    spans.append(dict(
-                        text=text,
-                        x1=sx1, y1=sy1, x2=sx2, y2=sy2,
-                        size=span.get('size', 8.0),
-                        rotation=0,
-                        color='000000',
-                    ))
-        return spans
-
-    except Exception as e:
-        print(f"  OCR利用不可（Tesseractが必要）: {e}")
+    if ocr_provider == 'none':
         return []
+
+    # ページを画像としてレンダリング（OCR用、200dpi）
+    def _render_page_image():
+        mat = fitz.Matrix(200 / 72, 200 / 72)
+        pix = page.get_pixmap(matrix=mat)
+        img_data = pix.tobytes("png")
+        return img_data, pix.width, pix.height, 200
+
+    # easyocr
+    if ocr_provider in ('auto', 'easyocr'):
+        try:
+            spans = _ocr_with_easyocr(page, transform, _render_page_image)
+            if spans:
+                return spans
+        except ImportError:
+            if ocr_provider == 'easyocr':
+                print("  easyocr未インストール: pip install easyocr")
+                return []
+        except Exception as e:
+            if ocr_provider == 'easyocr':
+                print(f"  easyocr エラー: {e}")
+                return []
+
+    # Tesseract (PyMuPDF経由)
+    if ocr_provider in ('auto', 'tesseract'):
+        try:
+            tp = page.get_textpage_ocr(flags=fitz.TEXT_PRESERVE_WHITESPACE, full=True)
+            blocks = page.get_text('dict', textpage=tp).get('blocks', [])
+            spans = _parse_text_blocks(blocks, transform)
+            if spans:
+                return spans
+        except Exception:
+            pass
+
+    if ocr_provider == 'auto':
+        print("  OCR利用不可: pip install easyocr を推奨")
+    return []
+
+
+def _ocr_with_easyocr(page, transform, render_func):
+    """easyocrを使用してテキストを抽出"""
+    import easyocr
+    import numpy as np
+    from PIL import Image
+    import io as _io
+
+    img_data, img_w, img_h, dpi = render_func()
+    img = Image.open(_io.BytesIO(img_data)).convert('RGB')
+    img_array = np.array(img)
+
+    # ページの表示寸法
+    page_w = page.rect.width   # pt
+    page_h = page.rect.height  # pt
+
+    # easyocrで認識
+    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    results = reader.readtext(img_array, detail=1, paragraph=False)
+
+    spans = []
+    for bbox_pts, text, confidence in results:
+        text = text.strip()
+        if not text or confidence < 0.3:
+            continue
+
+        # easyocr bbox: [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] (pixel coords)
+        px1 = min(p[0] for p in bbox_pts)
+        py1 = min(p[1] for p in bbox_pts)
+        px2 = max(p[0] for p in bbox_pts)
+        py2 = max(p[1] for p in bbox_pts)
+
+        # ピクセル → PDF pt (表示座標)
+        sx1 = px1 / dpi * 72
+        sy1 = py1 / dpi * 72
+        sx2 = px2 / dpi * 72
+        sy2 = py2 / dpi * 72
+
+        # テキストサイズ推定（bbox高さから）
+        text_height = sy2 - sy1
+        font_size = max(text_height * 0.85, 4.0)  # 85%がフォントサイズ相当
+
+        # 回転検出（bboxの傾きから）
+        dx = bbox_pts[1][0] - bbox_pts[0][0]
+        dy = bbox_pts[1][1] - bbox_pts[0][1]
+        angle = math.degrees(math.atan2(dy, dx))
+        if abs(angle) < 5:
+            text_rot = 0
+        elif abs(angle - 90) < 15 or abs(angle + 270) < 15:
+            text_rot = 90
+        elif abs(angle + 90) < 15 or abs(angle - 270) < 15:
+            text_rot = -90
+        else:
+            text_rot = round(angle)
+
+        spans.append(dict(
+            text=text,
+            x1=sx1, y1=sy1, x2=sx2, y2=sy2,
+            size=font_size,
+            rotation=text_rot,
+            color='000000',
+            font='Arial',
+            font_flags=0,
+        ))
+
+    return spans
+
+
+def _parse_text_blocks(blocks, transform):
+    """PyMuPDF text blocksからspanリストを生成"""
+    spans = []
+    for block in blocks:
+        if block['type'] != 0:
+            continue
+        for line in block.get('lines', []):
+            for span in line.get('spans', []):
+                text = span['text'].strip()
+                if not text:
+                    continue
+                bbox = span['bbox']
+                if transform:
+                    tx1, ty1 = transform(bbox[0], bbox[1])
+                    tx2, ty2 = transform(bbox[2], bbox[3])
+                    sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
+                    sy1, sy2 = min(ty1, ty2), max(ty1, ty2)
+                else:
+                    sx1, sy1, sx2, sy2 = bbox
+
+                spans.append(dict(
+                    text=text,
+                    x1=sx1, y1=sy1, x2=sx2, y2=sy2,
+                    size=span.get('size', 8.0),
+                    rotation=0,
+                    color='000000',
+                ))
+    return spans
 
 
 def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None, options: dict = None):
@@ -1570,6 +1674,12 @@ def main():
   python pid2xlsx.py input.pdf --min-line-width 0.5  # 細い線を除去
   python pid2xlsx.py input.pdf --no-dashes        # 破線を実線化
   python pid2xlsx.py input.pdf --no-text-outline-filter  # テキストアウトラインフィルタ無効
+  python pid2xlsx.py input.pdf --ocr easyocr    # easyocrでOCR（pip install easyocr）
+  python pid2xlsx.py input.pdf --ocr none       # OCR無効
+
+AutoCAD SHXフォントのPDF（テキストがベクトル化されている場合）:
+  python pid2xlsx.py shx_drawing.pdf            # 自動検出→easyocrでテキスト抽出
+  python pid2xlsx.py shx_drawing.pdf --ocr none # OCR無効（図形のみ、テキストなし）
 
 比較用に異なる設定で複数出力:
   python pid2xlsx.py input.pdf -o out_default.xlsx
@@ -1593,6 +1703,10 @@ def main():
                         help='ページあたりの最大シェイプ数。超過時に停止')
     parser.add_argument('--snap-threshold', type=float, default=1.5,
                         help='角度スナップ閾値(pt)。水平/垂直のずれがこの値未満なら補正（デフォルト: 1.5）')
+    parser.add_argument('--ocr', choices=['auto', 'easyocr', 'tesseract', 'none'],
+                        default='auto',
+                        help='OCRプロバイダ選択（テキストアウトライン検出時）。'
+                             'auto=easyocr優先→tesseract、none=OCR無効（デフォルト: auto）')
 
     args = parser.parse_args()
 
@@ -1611,6 +1725,7 @@ def main():
         'min_line_width': args.min_line_width,
         'max_shapes': args.max_shapes,
         'snap_threshold': args.snap_threshold,
+        'ocr': args.ocr,
     }
 
     convert_pid_to_xlsx(pdf_path, args.output, options=options)
