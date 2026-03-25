@@ -307,12 +307,12 @@ def analyze_page_content(page):
             small_closed_curves += 1
 
         # SHX ストローク検出: 高密度の直線パス群
-        # 特徴: 全て直線、5+アイテム、面積あたりのアイテム密度が高い
+        # 特徴: 全て直線、10+アイテム、密度 > 5.0/1000pt²
         n_items = len(items)
         all_lines = all(i[0] == 'l' for i in items)
         area = max(w * h, 1)
         density = n_items / area * 1000  # items per 1000 sq.pt
-        if all_lines and n_items >= 5 and density > 1.0:
+        if all_lines and n_items >= 10 and density > 5.0:
             shx_text_drawings += 1
             total_shx_items += n_items
 
@@ -377,14 +377,15 @@ def _is_text_outline_path(drawing, threshold, mode='truetype'):
         return False
 
     elif mode == 'shx':
-        # SHXストローク: 全て直線、5+アイテム、高密度
+        # SHXストローク: 全て直線、10+アイテム、高密度（>5/1000pt²）
+        # 厳格な閾値で図形（配管コネクタ、バルブ等）の誤検出を防止
         n_items = len(items)
         all_lines = all(i[0] == 'l' for i in items)
-        if not all_lines or n_items < 5:
+        if not all_lines or n_items < 10:
             return False
         area = max(w * h, 1)
         density = n_items / area * 1000
-        return density > 1.0
+        return density > 5.0
 
     return False
 
@@ -1389,7 +1390,9 @@ def build_drawing_xml(page, options=None) -> tuple:
     # テキストアウトラインモードでテキストが少ない場合: OCRフォールバック
     if text_outline_mode and text_count < 10:
         ocr_provider = options.get('ocr', 'auto')
-        ocr_spans = _ocr_text_fallback(page, transform, ocr_provider=ocr_provider)
+        ocr_languages = options.get('ocr_lang')
+        ocr_spans = _ocr_text_fallback(page, transform, ocr_provider=ocr_provider,
+                                        ocr_languages=ocr_languages)
         if ocr_spans:
             print(f"  OCRフォールバック: {len(ocr_spans)}テキスト抽出")
             for span in ocr_spans:
@@ -1415,7 +1418,7 @@ def build_drawing_xml(page, options=None) -> tuple:
     return xml_bytes, count
 
 
-def _ocr_text_fallback(page, transform=None, ocr_provider='auto'):
+def _ocr_text_fallback(page, transform=None, ocr_provider='auto', ocr_languages=None):
     """テキストがアウトライン化されている場合のOCRフォールバック
 
     OCRプロバイダ優先順位:
@@ -1423,6 +1426,7 @@ def _ocr_text_fallback(page, transform=None, ocr_provider='auto'):
     2. Tesseract (PyMuPDF経由、要システムインストール)
 
     ocr_provider: 'auto', 'easyocr', 'tesseract', 'none'
+    ocr_languages: easyocr言語リスト (例: ['en','ja'])
     """
     if ocr_provider == 'none':
         return []
@@ -1437,7 +1441,8 @@ def _ocr_text_fallback(page, transform=None, ocr_provider='auto'):
     # easyocr
     if ocr_provider in ('auto', 'easyocr'):
         try:
-            spans = _ocr_with_easyocr(page, transform, _render_page_image)
+            spans = _ocr_with_easyocr(page, transform, _render_page_image,
+                                       languages=ocr_languages)
             if spans:
                 return spans
         except ImportError:
@@ -1465,23 +1470,26 @@ def _ocr_text_fallback(page, transform=None, ocr_provider='auto'):
     return []
 
 
-def _ocr_with_easyocr(page, transform, render_func):
-    """easyocrを使用してテキストを抽出"""
+def _ocr_with_easyocr(page, transform, render_func, languages=None):
+    """easyocrを使用してテキストを抽出
+
+    languages: OCR言語リスト (例: ['en'], ['en','ja'])
+               デフォルト: ['en']
+    """
     import easyocr
     import numpy as np
     from PIL import Image
     import io as _io
 
+    if languages is None:
+        languages = ['en']
+
     img_data, img_w, img_h, dpi = render_func()
     img = Image.open(_io.BytesIO(img_data)).convert('RGB')
     img_array = np.array(img)
 
-    # ページの表示寸法
-    page_w = page.rect.width   # pt
-    page_h = page.rect.height  # pt
-
     # easyocrで認識
-    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    reader = easyocr.Reader(languages, gpu=False, verbose=False)
     results = reader.readtext(img_array, detail=1, paragraph=False)
 
     spans = []
@@ -1763,6 +1771,8 @@ AutoCAD SHXフォントのPDF（テキストがベクトル化されている場
                         default='auto',
                         help='OCRプロバイダ選択（テキストアウトライン検出時）。'
                              'auto=easyocr優先→tesseract、none=OCR無効（デフォルト: auto）')
+    parser.add_argument('--lang', default='en',
+                        help='OCR言語（カンマ区切り）。例: en,ja（デフォルト: en）')
 
     args = parser.parse_args()
 
@@ -1782,6 +1792,7 @@ AutoCAD SHXフォントのPDF（テキストがベクトル化されている場
         'max_shapes': args.max_shapes,
         'snap_threshold': args.snap_threshold,
         'ocr': args.ocr,
+        'ocr_lang': [l.strip() for l in args.lang.split(',')],
     }
 
     convert_pid_to_xlsx(pdf_path, args.output, options=options)
