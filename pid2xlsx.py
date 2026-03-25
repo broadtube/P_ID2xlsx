@@ -290,55 +290,102 @@ def analyze_page_content(page):
     # 閾値: ページ対角線の1.5%（典型的なフォントサイズに対応）
     outline_threshold = page_diag * 0.015
 
-    small_closed_curves = 0
+    small_closed_curves = 0  # TrueType アウトライン（閉じたベジェ曲線）
+    shx_text_drawings = 0    # SHX ストローク（高密度のオープン直線パス）
+    total_shx_items = 0
+
     for d in drawings:
         items = d['items']
         rect = d['rect']
-        max_dim = max(rect.x1 - rect.x0, rect.y1 - rect.y0)
+        w = rect.x1 - rect.x0
+        h = rect.y1 - rect.y0
+        max_dim = max(w, h)
+
+        # TrueType テキストアウトライン: 小さい閉じたベジェ曲線パス
         has_curves = any(i[0] == 'c' for i in items)
         if has_curves and max_dim < outline_threshold and d.get('closePath', False):
             small_closed_curves += 1
 
-    # テキストアウトラインと判定:
-    # - 小さい閉じた曲線パスが全描画の20%以上、かつ
-    # - テキストスパンが少ない（描画数の10%未満）or 小さい閉じた曲線が100個以上
+        # SHX ストローク検出: 高密度の直線パス群
+        # 特徴: 全て直線、5+アイテム、面積あたりのアイテム密度が高い
+        n_items = len(items)
+        all_lines = all(i[0] == 'l' for i in items)
+        area = max(w * h, 1)
+        density = n_items / area * 1000  # items per 1000 sq.pt
+        if all_lines and n_items >= 5 and density > 1.0:
+            shx_text_drawings += 1
+            total_shx_items += n_items
+
+    # テキストアウトラインと判定（TrueType or SHX）
     text_outline_detected = False
+    outline_mode = None  # 'truetype' or 'shx'
+
     if draw_count > 0:
-        curve_ratio = small_closed_curves / draw_count
         text_ratio = text_spans / max(draw_count, 1)
+
+        # TrueType テキストアウトライン
+        curve_ratio = small_closed_curves / draw_count
         if (small_closed_curves > 100 or curve_ratio > 0.2) and text_ratio < 0.1:
             text_outline_detected = True
+            outline_mode = 'truetype'
         elif small_closed_curves > 500:
-            # 絶対数が非常に多い場合は無条件で検出
             text_outline_detected = True
+            outline_mode = 'truetype'
+
+        # SHX ストロークテキスト: テキストスパンが少なく、高密度直線パスが多い
+        if not text_outline_detected:
+            shx_ratio = shx_text_drawings / draw_count
+            if (shx_text_drawings >= 5 and shx_ratio > 0.3) and text_ratio < 0.1:
+                text_outline_detected = True
+                outline_mode = 'shx'
+            elif total_shx_items > 500 and text_ratio < 0.1:
+                text_outline_detected = True
+                outline_mode = 'shx'
 
     return {
         'text_span_count': text_spans,
         'drawing_count': draw_count,
         'text_outline_detected': text_outline_detected,
+        'text_outline_mode': outline_mode,  # 'truetype', 'shx', or None
         'text_outline_threshold': outline_threshold,
         'small_closed_curves': small_closed_curves,
+        'shx_text_drawings': shx_text_drawings,
+        'total_shx_items': total_shx_items,
         'page_diag': page_diag,
     }
 
 
-def _is_text_outline_path(drawing, threshold):
-    """描画パスがテキストアウトライン（文字の輪郭）かどうか判定
+def _is_text_outline_path(drawing, threshold, mode='truetype'):
+    """描画パスがテキストアウトライン（文字の輪郭/ストローク）かどうか判定
 
-    テキストアウトラインの特徴:
-    - 小さい（< threshold）
-    - 閉じたパス
-    - ベジェ曲線を含む
+    mode='truetype': 閉じたベジェ曲線パス（TrueTypeアウトライン）
+    mode='shx': 高密度のオープン直線パス（SHXストロークフォント）
     """
     items = drawing['items']
     rect = drawing['rect']
-    max_dim = max(rect.x1 - rect.x0, rect.y1 - rect.y0)
-    if max_dim >= threshold:
+    w = rect.x1 - rect.x0
+    h = rect.y1 - rect.y0
+    max_dim = max(w, h)
+
+    if mode == 'truetype':
+        if max_dim >= threshold:
+            return False
+        if not drawing.get('closePath', False):
+            return False
+        if any(i[0] == 'c' for i in items):
+            return True
         return False
-    if not drawing.get('closePath', False):
-        return False
-    if any(i[0] == 'c' for i in items):
-        return True
+
+    elif mode == 'shx':
+        # SHXストローク: 全て直線、5+アイテム、高密度
+        n_items = len(items)
+        all_lines = all(i[0] == 'l' for i in items)
+        if not all_lines or n_items < 5:
+            return False
+        area = max(w * h, 1)
+        density = n_items / area * 1000
+        return density > 1.0
+
     return False
 
 
@@ -1179,9 +1226,17 @@ def build_drawing_xml(page, options=None) -> tuple:
     if options.get('no_text_outline_filter'):
         text_outline_mode = False
 
+    # テキストアウトラインの検出モード ('truetype', 'shx', or None)
+    outline_detect_mode = analysis.get('text_outline_mode')
+
     if text_outline_mode:
-        print(f"  WARNING: テキストアウトライン検出: {analysis['small_closed_curves']}個の"
-              f"小さい閉じた曲線パスをフィルタリング")
+        if outline_detect_mode == 'shx':
+            print(f"  WARNING: SHXストロークテキスト検出: "
+                  f"{analysis['shx_text_drawings']}描画/"
+                  f"{analysis['total_shx_items']}アイテムをフィルタリング")
+        else:
+            print(f"  WARNING: テキストアウトライン検出: "
+                  f"{analysis['small_closed_curves']}個の小さい閉じた曲線パスをフィルタリング")
         print(f"    テキストスパン: {analysis['text_span_count']}、"
               f"描画パス: {analysis['drawing_count']}")
 
@@ -1214,7 +1269,8 @@ def build_drawing_xml(page, options=None) -> tuple:
             break
 
         # テキストアウトラインモード: 小さい閉じた曲線パスを除外
-        if text_outline_mode and _is_text_outline_path(d, outline_threshold):
+        if text_outline_mode and _is_text_outline_path(d, outline_threshold,
+                                                          mode=outline_detect_mode or 'truetype'):
             skipped_outlines += 1
             continue
 
