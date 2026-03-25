@@ -182,33 +182,48 @@ def create_shx_test_pdf(output_path="test_pdfs/shx_test_pid.pdf"):
     draw_shx_text(page, "HV-101", 272, 435, 6)
 
     # === 計器 ===
-    # 温度計 TI-101
-    shape = page.new_shape()
+    # 温度計 TI-101（円と接続線を分離）
     ix, iy = 620, 280
+    shape = page.new_shape()
     shape.draw_circle(fitz.Point(ix, iy), 12)
+    shape.finish(color=(0, 0, 0), width=0.5)
+    shape.commit()
+    shape = page.new_shape()
     shape.draw_line(fitz.Point(ix, iy+12), fitz.Point(ix, iy+30))
     shape.finish(color=(0, 0, 0), width=0.5)
     shape.commit()
     draw_shx_text(page, "TI", ix-6, iy-6, 7)
     draw_shx_text(page, "101", ix-9, iy+2, 6)
 
-    # 圧力計 PI-101
-    shape = page.new_shape()
+    # 圧力計 PI-101（円と接続線を分離）
     ix, iy = 620, 480
+    shape = page.new_shape()
     shape.draw_circle(fitz.Point(ix, iy), 12)
+    shape.finish(color=(0, 0, 0), width=0.5)
+    shape.commit()
+    shape = page.new_shape()
     shape.draw_line(fitz.Point(ix, iy-12), fitz.Point(ix, iy-30))
+    shape.finish(color=(0, 0, 0), width=0.5)
+    shape.commit()
+    shape = page.new_shape()
     shape.draw_line(fitz.Point(ix, iy-30), fitz.Point(560, iy-30))
     shape.finish(color=(0, 0, 0), width=0.5)
     shape.commit()
     draw_shx_text(page, "PI", ix-6, iy-6, 7)
     draw_shx_text(page, "101", ix-9, iy+2, 6)
 
-    # フロー計 FI-101
-    shape = page.new_shape()
+    # フロー計 FI-101（円と接続線を分離）
     ix, iy = 820, 280
+    shape = page.new_shape()
     shape.draw_circle(fitz.Point(ix, iy), 12)
+    shape.finish(color=(0, 0, 0), width=0.5)
+    shape.commit()
+    shape = page.new_shape()
     shape.draw_line(fitz.Point(ix, iy+12), fitz.Point(ix, iy+30))
-    shape.draw_line(fitz.Point(ix, iy+30), fitz.Point(820, 350))
+    shape.finish(color=(0, 0, 0), width=0.5)
+    shape.commit()
+    shape = page.new_shape()
+    shape.draw_line(fitz.Point(820, iy+30), fitz.Point(820, 350))
     shape.finish(color=(0, 0, 0), width=0.5)
     shape.commit()
     draw_shx_text(page, "FI", ix-6, iy-6, 7)

@@ -962,14 +962,15 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
     if any(i[0] in ('re', 'qu') for i in items):
         return dict(type='rect', **base)
 
-    # 円/楕円（4+ ベジェ曲線、アスペクト比不問）
+    # 円/楕円（4+ ベジェ曲線、直線なし）
     curve_items = [i for i in items if i[0] == 'c']
-    if len(curve_items) >= 4:
+    line_items_in_mix = [i for i in items if i[0] == 'l']
+    if len(curve_items) >= 4 and len(line_items_in_mix) == 0:
         w, h = x2 - x1, y2 - y1
         if w > 0 and h > 0:
             return dict(type='ellipse', **base)
 
-    # ベジェ曲線を含むパス → カスタムジオメトリ
+    # ベジェ曲線を含むパス → カスタムジオメトリ（円+直線の混合含む）
     if curve_items:
         t_items = transform_items(items, transform) if transform else items
         return dict(type='freeform', items=t_items, closePath=closePath, **base)
@@ -1431,12 +1432,13 @@ def _ocr_text_fallback(page, transform=None, ocr_provider='auto', ocr_languages=
     if ocr_provider == 'none':
         return []
 
-    # ページを画像としてレンダリング（OCR用、200dpi）
+    # ページを画像としてレンダリング（OCR用、300dpi）
     def _render_page_image():
-        mat = fitz.Matrix(200 / 72, 200 / 72)
+        ocr_dpi = 300
+        mat = fitz.Matrix(ocr_dpi / 72, ocr_dpi / 72)
         pix = page.get_pixmap(matrix=mat)
         img_data = pix.tobytes("png")
-        return img_data, pix.width, pix.height, 200
+        return img_data, pix.width, pix.height, ocr_dpi
 
     # easyocr
     if ocr_provider in ('auto', 'easyocr'):
