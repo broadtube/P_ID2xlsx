@@ -383,17 +383,18 @@ def _is_text_outline_path(drawing, threshold, mode='truetype'):
             return False
         # 閾値を段階的に設定:
         #   10+アイテム: density > 5.0/1000pt²（確実にテキスト）
-        #   3+アイテム: density > 8.0/1000pt²（短いテキストも捕捉、厳格）
+        #   5+アイテム: density > 8.0/1000pt²（短いテキストも捕捉、厳格）
+        # 3-4アイテムはブラケット・角マーク等の誤検出リスクがあるため除外
         n_items = len(items)
         all_lines = all(i[0] == 'l' for i in items)
-        if not all_lines or n_items < 3:
+        if not all_lines or n_items < 5:
             return False
         area = max(w * h, 1)
         density = n_items / area * 1000
         if n_items >= 10:
             return density > 5.0
         else:
-            # 短いストローク（3-9アイテム）: より厳格な密度閾値
+            # 短いストローク（5-9アイテム）: より厳格な密度閾値
             return density > 8.0
 
     return False
@@ -1302,28 +1303,40 @@ def build_drawing_xml(page, options=None) -> tuple:
                     raw_rects.append((r.x0, r.y0, r.x1, r.y1))
         # 隣接・重複するアノテーション矩形をマージ（複数行テキスト対応）
         # gap_threshold: この距離以内の矩形を同一テキストブロックとしてマージ
+        # 反復マージでチェーン（A-B-C、Aは直接Cと隣接しない）にも対応
         gap_threshold = 4.0  # pt
-        merged = []
-        for rx0, ry0, rx1, ry1 in raw_rects:
-            found = False
-            for k, (mx0, my0, mx1, my1) in enumerate(merged):
-                # 水平方向の重なりがあり、垂直方向がgap以内なら同一ブロック
-                h_overlap = min(rx1, mx1) - max(rx0, mx0)
-                v_gap = max(ry0 - my1, my0 - ry1)
-                # または垂直方向の重なりがあり、水平方向がgap以内
-                v_overlap = min(ry1, my1) - max(ry0, my0)
-                h_gap = max(rx0 - mx1, mx0 - rx1)
-                if (h_overlap > 0 and v_gap < gap_threshold) or \
-                   (v_overlap > 0 and h_gap < gap_threshold):
-                    merged[k] = (min(rx0, mx0), min(ry0, my0),
-                                 max(rx1, mx1), max(ry1, my1))
-                    found = True
-                    break
-            if not found:
-                merged.append((rx0, ry0, rx1, ry1))
-        # マージ後、2pt余裕で拡大
+        merged = list(raw_rects)
+        changed = True
+        while changed:
+            changed = False
+            new_merged = []
+            used = [False] * len(merged)
+            for i in range(len(merged)):
+                if used[i]:
+                    continue
+                rx0, ry0, rx1, ry1 = merged[i]
+                for j in range(i + 1, len(merged)):
+                    if used[j]:
+                        continue
+                    mx0, my0, mx1, my1 = merged[j]
+                    h_overlap = min(rx1, mx1) - max(rx0, mx0)
+                    v_gap = max(ry0 - my1, my0 - ry1)
+                    v_overlap = min(ry1, my1) - max(ry0, my0)
+                    h_gap = max(rx0 - mx1, mx0 - rx1)
+                    if (h_overlap > 0 and v_gap < gap_threshold) or \
+                       (v_overlap > 0 and h_gap < gap_threshold):
+                        rx0 = min(rx0, mx0)
+                        ry0 = min(ry0, my0)
+                        rx1 = max(rx1, mx1)
+                        ry1 = max(ry1, my1)
+                        used[j] = True
+                        changed = True
+                new_merged.append((rx0, ry0, rx1, ry1))
+                used[i] = True
+            merged = new_merged
+        # マージ後、3pt余裕で拡大（SHXストロークが文字輪郭を少し超える場合をカバー）
         for mx0, my0, mx1, my1 in merged:
-            shx_annot_rects.append((mx0 - 2, my0 - 2, mx1 + 2, my1 + 2))
+            shx_annot_rects.append((mx0 - 3, my0 - 3, mx1 + 3, my1 + 3))
 
     shape_id = 2
     count = 0
@@ -1570,8 +1583,8 @@ def _extract_shx_annotations(page, transform=None):
         # 短辺ベースの推定（アノテーション矩形はテキストより大きいので控えめに）
         fs_from_short = short * 0.7
         if len(content) > 1:
-            # 長辺と文字数から推定（平均文字幅≈フォントサイズ×0.5）
-            fs_from_chars = long_dim / (len(content) * 0.5)
+            # 長辺と文字数から推定（平均文字幅≈フォントサイズ×0.6）
+            fs_from_chars = long_dim / (len(content) * 0.6)
             font_size = max(min(fs_from_short, fs_from_chars), 3.0)
         else:
             font_size = max(fs_from_short, 3.0)
