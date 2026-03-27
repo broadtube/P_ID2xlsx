@@ -377,15 +377,24 @@ def _is_text_outline_path(drawing, threshold, mode='truetype'):
         return False
 
     elif mode == 'shx':
-        # SHXストローク: 全て直線、10+アイテム、高密度（>5/1000pt²）
-        # 厳格な閾値で図形（配管コネクタ、バルブ等）の誤検出を防止
+        # SHXストローク: 全て直線、塗りなし、高密度
+        # 塗りつぶしがある図形はテキストではない（フロー方向矢印等）
+        if drawing.get('fill') is not None:
+            return False
+        # 閾値を段階的に設定:
+        #   10+アイテム: density > 5.0/1000pt²（確実にテキスト）
+        #   3+アイテム: density > 8.0/1000pt²（短いテキストも捕捉、厳格）
         n_items = len(items)
         all_lines = all(i[0] == 'l' for i in items)
-        if not all_lines or n_items < 10:
+        if not all_lines or n_items < 3:
             return False
         area = max(w * h, 1)
         density = n_items / area * 1000
-        return density > 5.0
+        if n_items >= 10:
+            return density > 5.0
+        else:
+            # 短いストローク（3-9アイテム）: より厳格な密度閾値
+            return density > 8.0
 
     return False
 
@@ -769,15 +778,24 @@ def _triangle_rotation(tpts):
     """三角形の3頂点から、頂点(apex)が指す方向に応じたExcel回転値を返す。
     Excelのtriangleプリセットはデフォルトで頂点が上を向く。
     回転値: 0=上, 5400000=右, 10800000=下, 16200000=左"""
-    # 最長辺（底辺）を見つけ、その対頂点がapex
+    # 「特異辺」（他の2辺と最も長さが異なる辺）を底辺とし、その対頂点がapex
+    # 二等辺三角形で等辺>底辺のケース（矢印マーカー等）を正しく処理
     edges = []
     for i in range(3):
         j = (i + 1) % 3
-        dist = (tpts[i][0] - tpts[j][0]) ** 2 + (tpts[i][1] - tpts[j][1]) ** 2
+        dist = math.sqrt((tpts[i][0] - tpts[j][0]) ** 2 + (tpts[i][1] - tpts[j][1]) ** 2)
         edges.append((dist, i, j))
-    edges.sort(reverse=True)
-    # 最長辺の2頂点のインデックス
-    _, bi, bj = edges[0]
+    edges.sort(key=lambda e: e[0])  # 短い順にソート
+    # 3辺の長さ: shortest, middle, longest
+    d0, d1, d2 = edges[0][0], edges[1][0], edges[2][0]
+    # 最短辺と中間辺の差 vs 中間辺と最長辺の差で底辺を判定
+    if (d1 - d0) < (d2 - d1):
+        # 短い2辺が近い → 底辺は最長辺
+        base_edge = edges[2]
+    else:
+        # 長い2辺が近い → 底辺は最短辺
+        base_edge = edges[0]
+    _, bi, bj = base_edge
     apex_idx = 3 - bi - bj  # 残りの頂点
     apex = tpts[apex_idx]
     base_mid = ((tpts[bi][0] + tpts[bj][0]) / 2, (tpts[bi][1] + tpts[bj][1]) / 2)
@@ -958,8 +976,20 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
                 line_color=line_color, fill_color=fill_color, line_width=line_width_emu,
                 dash_preset=dash_preset, line_cap=line_cap, line_join=line_join)
 
-    # 矩形
+    # 矩形 / ダイヤモンド
     if any(i[0] in ('re', 'qu') for i in items):
+        # quアイテムがダイヤモンド（45°回転した四角形）かチェック
+        qu_items = [i for i in items if i[0] == 'qu']
+        if qu_items:
+            quad = qu_items[0][1]  # fitz.Quad
+            edges = [
+                (quad.ul, quad.ur), (quad.ur, quad.lr),
+                (quad.lr, quad.ll), (quad.ll, quad.ul),
+            ]
+            diag_count = sum(1 for p1, p2 in edges
+                             if abs(p2.x - p1.x) > 1.5 and abs(p2.y - p1.y) > 1.5)
+            if diag_count >= 3:
+                return dict(type='diamond', **base)
         return dict(type='rect', **base)
 
     # 円/楕円（4+ ベジェ曲線、直線なし）
@@ -1007,10 +1037,11 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
                     tpts = list(pts)
                 # 頂点の向きを判定（頂点から対辺の中点への方向）
                 tri_rot = _triangle_rotation(tpts)
-                # 矢印三角形は塗りつぶしで描画
+                # 塗りつぶし: PDFのfill属性を尊重（fillがあればfill色、なければアウトラインのみ）
+                tri_fill = fill_color if fill_color else None
                 return dict(type='triangle', shape_rot=tri_rot,
                             x1=x1, y1=y1, x2=x2, y2=y2,
-                            line_color=line_color, fill_color=line_color,
+                            line_color=line_color, fill_color=tri_fill,
                             line_width=line_width_emu)
 
         # ホームベース検出: 5直線、5頂点（矩形+一辺が三角形）
@@ -1259,6 +1290,41 @@ def build_drawing_xml(page, options=None) -> tuple:
             rect = d['rect']
             valve_rects.append((rect.x0, rect.y0, rect.x1, rect.y1))
 
+    # Pass 1.5: SHXアノテーション位置を収集（アノテーション位置と重なるストロークを除去用）
+    shx_annot_rects = []
+    if text_outline_mode and not options.get('no_shx_annot'):
+        raw_rects = []
+        for annot in (page.annots() or []):
+            if annot.type[0] == 4:  # Square annotation
+                content = annot.info.get('content', '').strip()
+                if content:
+                    r = annot.rect
+                    raw_rects.append((r.x0, r.y0, r.x1, r.y1))
+        # 隣接・重複するアノテーション矩形をマージ（複数行テキスト対応）
+        # gap_threshold: この距離以内の矩形を同一テキストブロックとしてマージ
+        gap_threshold = 4.0  # pt
+        merged = []
+        for rx0, ry0, rx1, ry1 in raw_rects:
+            found = False
+            for k, (mx0, my0, mx1, my1) in enumerate(merged):
+                # 水平方向の重なりがあり、垂直方向がgap以内なら同一ブロック
+                h_overlap = min(rx1, mx1) - max(rx0, mx0)
+                v_gap = max(ry0 - my1, my0 - ry1)
+                # または垂直方向の重なりがあり、水平方向がgap以内
+                v_overlap = min(ry1, my1) - max(ry0, my0)
+                h_gap = max(rx0 - mx1, mx0 - rx1)
+                if (h_overlap > 0 and v_gap < gap_threshold) or \
+                   (v_overlap > 0 and h_gap < gap_threshold):
+                    merged[k] = (min(rx0, mx0), min(ry0, my0),
+                                 max(rx1, mx1), max(ry1, my1))
+                    found = True
+                    break
+            if not found:
+                merged.append((rx0, ry0, rx1, ry1))
+        # マージ後、2pt余裕で拡大
+        for mx0, my0, mx1, my1 in merged:
+            shx_annot_rects.append((mx0 - 2, my0 - 2, mx1 + 2, my1 + 2))
+
     shape_id = 2
     count = 0
     skipped_outlines = 0
@@ -1275,6 +1341,28 @@ def build_drawing_xml(page, options=None) -> tuple:
                                                           mode=outline_detect_mode or 'truetype'):
             skipped_outlines += 1
             continue
+
+        # SHXアノテーション位置と重なるストロークを除去
+        # （密度フィルタで漏れた短いテキストストロークをカバー）
+        # 塗りつぶし図形はテキストではないので除外（フロー矢印等を保護）
+        if shx_annot_rects and d.get('fill') is None:
+            rect = d['rect']
+            is_shx_overlap = False
+            for ax0, ay0, ax1, ay1 in shx_annot_rects:
+                # 描画bboxがアノテーション内に30%以上含まれるか
+                ox0 = max(rect.x0, ax0)
+                oy0 = max(rect.y0, ay0)
+                ox1 = min(rect.x1, ax1)
+                oy1 = min(rect.y1, ay1)
+                if ox0 < ox1 and oy0 < oy1:
+                    draw_area = max((rect.x1 - rect.x0) * (rect.y1 - rect.y0), 0.01)
+                    overlap = (ox1 - ox0) * (oy1 - oy0)
+                    if overlap / draw_area > 0.3:
+                        is_shx_overlap = True
+                        break
+            if is_shx_overlap:
+                skipped_outlines += 1
+                continue
 
         # バルブの辺（三角形の一辺）を抑制
         if _is_valve_edge_line(d, valve_rects):
@@ -1388,18 +1476,34 @@ def build_drawing_xml(page, options=None) -> tuple:
         count += 1
         text_count += 1
 
-    # テキストアウトラインモードでテキストが少ない場合: OCRフォールバック
+    # テキストアウトラインモードでテキストが少ない場合:
+    # 1. SHXアノテーションからテキスト抽出（最優先、正確）
+    # 2. OCRフォールバック（アノテーションがない場合）
     if text_outline_mode and text_count < 10:
-        ocr_provider = options.get('ocr', 'auto')
-        ocr_languages = options.get('ocr_lang')
-        ocr_spans = _ocr_text_fallback(page, transform, ocr_provider=ocr_provider,
-                                        ocr_languages=ocr_languages)
-        if ocr_spans:
-            print(f"  OCRフォールバック: {len(ocr_spans)}テキスト抽出")
-            for span in ocr_spans:
+        # まずSHXアノテーションを試行（--no-shx-annotで無効化可能）
+        shx_spans = [] if options.get('no_shx_annot') else _extract_shx_annotations(page, transform)
+        fallback_spans = []
+        fallback_source = None
+
+        if shx_spans:
+            fallback_spans = shx_spans
+            fallback_source = 'SHXアノテーション'
+        else:
+            # アノテーションがなければOCR
+            ocr_provider = options.get('ocr', 'auto')
+            ocr_languages = options.get('ocr_lang')
+            ocr_spans = _ocr_text_fallback(page, transform, ocr_provider=ocr_provider,
+                                            ocr_languages=ocr_languages)
+            if ocr_spans:
+                fallback_spans = ocr_spans
+                fallback_source = 'OCR'
+
+        if fallback_spans:
+            print(f"  {fallback_source}: {len(fallback_spans)}テキスト抽出")
+            for span in fallback_spans:
                 elem = make_shape_xml(
                     shape_id=shape_id,
-                    name=f'ocr_text_{shape_id}',
+                    name=f'text_{shape_id}',
                     prst='rect',
                     x1=span['x1'], y1=span['y1'],
                     x2=span['x2'], y2=span['y2'],
@@ -1409,6 +1513,8 @@ def build_drawing_xml(page, options=None) -> tuple:
                     font_size=span.get('size', 8.0),
                     no_line=True,
                     text_rotation=span.get('rotation', 0),
+                    font_name=span.get('font', 'Arial'),
+                    font_flags=span.get('font_flags', 0),
                 )
                 root.append(elem)
                 shape_id += 1
@@ -1417,6 +1523,77 @@ def build_drawing_xml(page, options=None) -> tuple:
     xml_bytes = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
     xml_bytes += tostring(root, encoding='unicode').encode('utf-8')
     return xml_bytes, count
+
+
+def _extract_shx_annotations(page, transform=None):
+    """AutoCAD SHX Textアノテーションからテキストを抽出
+
+    AutoCADがPDF出力時にSHXテキストの元内容をSquareアノテーションとして保存する。
+    title='AutoCAD SHX Text'、content=元テキスト、rect=位置。
+    OCRより正確で高速。
+    """
+    annots = page.annots()
+    if not annots:
+        return []
+
+    spans = []
+    for annot in annots:
+        info = annot.info
+        title = info.get('title', '')
+        if 'SHX' not in title.upper() and 'AutoCAD' not in title:
+            # title が無い場合でもSquareアノテーションでcontentがあればSHXテキストの可能性
+            if annot.type[0] != 4:  # 4 = Square
+                continue
+            if not info.get('content', '').strip():
+                continue
+
+        content = info.get('content', '').strip()
+        if not content:
+            continue
+
+        rect = annot.rect  # mediabox座標
+
+        if transform:
+            tx1, ty1 = transform(rect.x0, rect.y0)
+            tx2, ty2 = transform(rect.x1, rect.y1)
+            sx1, sx2 = min(tx1, tx2), max(tx1, tx2)
+            sy1, sy2 = min(ty1, ty2), max(ty1, ty2)
+        else:
+            sx1, sy1 = rect.x0, rect.y0
+            sx2, sy2 = rect.x1, rect.y1
+
+        # フォントサイズ推定
+        w = sx2 - sx1
+        h = sy2 - sy1
+        short = min(w, h)
+        long_dim = max(w, h)
+        # 短辺ベースの推定（アノテーション矩形はテキストより大きいので控えめに）
+        fs_from_short = short * 0.7
+        if len(content) > 1:
+            # 長辺と文字数から推定（平均文字幅≈フォントサイズ×0.5）
+            fs_from_chars = long_dim / (len(content) * 0.5)
+            font_size = max(min(fs_from_short, fs_from_chars), 3.0)
+        else:
+            font_size = max(fs_from_short, 3.0)
+
+        # 回転推定（アノテーション矩形のアスペクト比から）
+        # 横長=水平テキスト、縦長=垂直テキスト
+        if h > w * 1.5 and len(content) > 1:
+            text_rot = 90  # 縦書き
+        else:
+            text_rot = 0
+
+        spans.append(dict(
+            text=content,
+            x1=sx1, y1=sy1, x2=sx2, y2=sy2,
+            size=font_size,
+            rotation=text_rot,
+            color='000000',
+            font='Arial',
+            font_flags=0,
+        ))
+
+    return spans
 
 
 def _ocr_text_fallback(page, transform=None, ocr_provider='auto', ocr_languages=None):
@@ -1771,8 +1948,10 @@ AutoCAD SHXフォントのPDF（テキストがベクトル化されている場
                         help='角度スナップ閾値(pt)。水平/垂直のずれがこの値未満なら補正（デフォルト: 1.5）')
     parser.add_argument('--ocr', choices=['auto', 'easyocr', 'tesseract', 'none'],
                         default='auto',
-                        help='OCRプロバイダ選択（テキストアウトライン検出時）。'
+                        help='OCRプロバイダ選択（SHXアノテーションがない場合に使用）。'
                              'auto=easyocr優先→tesseract、none=OCR無効（デフォルト: auto）')
+    parser.add_argument('--no-shx-annot', action='store_true',
+                        help='SHXアノテーションからのテキスト抽出を無効化（OCRを強制使用）')
     parser.add_argument('--lang', default='en',
                         help='OCR言語（カンマ区切り）。例: en,ja（デフォルト: en）')
 
@@ -1794,6 +1973,7 @@ AutoCAD SHXフォントのPDF（テキストがベクトル化されている場
         'max_shapes': args.max_shapes,
         'snap_threshold': args.snap_threshold,
         'ocr': args.ocr,
+        'no_shx_annot': args.no_shx_annot,
         'ocr_lang': [l.strip() for l in args.lang.split(',')],
     }
 
