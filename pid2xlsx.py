@@ -1398,9 +1398,22 @@ def build_drawing_xml(page, options=None) -> tuple:
                         if bx0 <= smx <= bx1 and by0 <= smy <= by1:
                             sw = sr.x1 - sr.x0
                             sh = sr.y1 - sr.y0
-                            if max(sw, sh) < 15:  # 短い線のみ
+                            if max(sw, sh) < 15:
                                 arrow_suppress.add(si)
                 break
+
+    # 塗りつぶし三角形と重複するアウトライン三角形も抑制
+    # （3L filled + 3L unfilled が同位置に重なるパターン）
+    filled_tris = [(i, r, f) for i, r, f in arrow_tris if f]  # has_fill=True
+    unfilled_tris_only = [(i, r) for i, r, f in arrow_tris if not f]
+    for fi, fr, _ in filled_tris:
+        fcx = (fr.x0 + fr.x1) / 2
+        fcy = (fr.y0 + fr.y1) / 2
+        for ui, ur in unfilled_tris_only:
+            ucx = (ur.x0 + ur.x1) / 2
+            ucy = (ur.y0 + ur.y1) / 2
+            if abs(fcx - ucx) < 2 and abs(fcy - ucy) < 2:
+                arrow_suppress.add(ui)
 
     # Pass 1.5: SHXアノテーション位置を収集（アノテーション位置と重なるストロークを除去用）
     shx_annot_rects = []
