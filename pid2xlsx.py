@@ -1100,7 +1100,7 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
             lines.append(dict(type='line', x1=lx1, y1=ly1, x2=lx2, y2=ly2,
                               line_color=line_color, fill_color=None, line_width=line_width_emu,
                               dash_preset=dash_preset, line_cap=line_cap, line_join=line_join))
-        return dict(type='multi_line', lines=lines)
+        return dict(type='multi_line', lines=lines, closePath=closePath, **base)
 
     return None
 
@@ -1499,27 +1499,55 @@ def build_drawing_xml(page, options=None) -> tuple:
         if options.get('no_dashes'):
             info['dash_preset'] = 'solid'
 
-        # 複数直線 → 個別の線として展開
+        # 複数直線
         if info.get('type') == 'multi_line':
-            for line_info in info['lines']:
-                if options.get('no_dashes'):
-                    line_info['dash_preset'] = 'solid'
+            # 小さい塗りつぶし図形はfreeformとして描画（フロー矢印等）
+            # 大きい塗りつぶしmulti_line（枠線・ハッチング等）は個別線に展開
+            ml_w = abs(info.get('x2', 0) - info.get('x1', 0))
+            ml_h = abs(info.get('y2', 0) - info.get('y1', 0))
+            if info.get('fill_color') and max(ml_w, ml_h) < 30:
+                path_items = []
+                for li in info['lines']:
+                    import fitz as _fitz
+                    p1 = _fitz.Point(li['x1'], li['y1'])
+                    p2 = _fitz.Point(li['x2'], li['y2'])
+                    path_items.append(('l', p1, p2))
                 elem = make_shape_xml(
                     shape_id=shape_id,
-                    name=f'line_{shape_id}',
-                    prst='line',
-                    x1=line_info['x1'], y1=line_info['y1'],
-                    x2=line_info['x2'], y2=line_info['y2'],
-                    line_width_emu=line_info['line_width'],
-                    line_color=line_info['line_color'],
-                    fill_color=None,
-                    dash_preset=line_info.get('dash_preset'),
-                    line_cap=line_info.get('line_cap'),
-                    line_join=line_info.get('line_join'),
+                    name=f'shape_{shape_id}',
+                    prst='rect',
+                    x1=info['x1'], y1=info['y1'],
+                    x2=info['x2'], y2=info['y2'],
+                    line_width_emu=info['line_width'],
+                    line_color=info['line_color'],
+                    fill_color=info['fill_color'],
+                    path_items=path_items,
+                    closePath=True,
                 )
                 root.append(elem)
                 shape_id += 1
                 count += 1
+            else:
+                # 塗りなし → 個別の線として展開
+                for line_info in info['lines']:
+                    if options.get('no_dashes'):
+                        line_info['dash_preset'] = 'solid'
+                    elem = make_shape_xml(
+                        shape_id=shape_id,
+                        name=f'line_{shape_id}',
+                        prst='line',
+                        x1=line_info['x1'], y1=line_info['y1'],
+                        x2=line_info['x2'], y2=line_info['y2'],
+                        line_width_emu=line_info['line_width'],
+                        line_color=line_info['line_color'],
+                        fill_color=None,
+                        dash_preset=line_info.get('dash_preset'),
+                        line_cap=line_info.get('line_cap'),
+                        line_join=line_info.get('line_join'),
+                    )
+                    root.append(elem)
+                    shape_id += 1
+                    count += 1
             continue
 
         dx = abs(info['x2'] - info['x1'])
