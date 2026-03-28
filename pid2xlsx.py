@@ -1749,13 +1749,40 @@ def _extract_shx_annotations(page, transform=None):
     AutoCADがPDF出力時にSHXテキストの元内容をSquareアノテーションとして保存する。
     title='AutoCAD SHX Text'、content=元テキスト、rect=位置。
     OCRより正確で高速。
+    テキスト色はアノテーション矩形内のSHXストローク色から推定。
     """
-    annots = page.annots()
+    annots = list(page.annots() or [])
     if not annots:
         return []
 
+    # SHXストロークの色マップを構築（アノテーション矩形→最頻色）
+    drawings = page.get_drawings()
+    annot_colors = {}  # annot_index → color_hex
+    for ai, annot in enumerate(annots):
+        if annot.type[0] != 4:
+            continue
+        content = annot.info.get('content', '').strip()
+        if not content:
+            continue
+        r = annot.rect
+        # 矩形内のストローク色を収集
+        color_counts = {}
+        for d in drawings:
+            dr = d['rect']
+            mid_x = (dr.x0 + dr.x1) / 2
+            mid_y = (dr.y0 + dr.y1) / 2
+            if r.x0 - 1 <= mid_x <= r.x1 + 1 and r.y0 - 1 <= mid_y <= r.y1 + 1:
+                c = d.get('color')
+                if c:
+                    key = (round(c[0], 2), round(c[1], 2), round(c[2], 2))
+                    color_counts[key] = color_counts.get(key, 0) + 1
+        if color_counts:
+            dominant = max(color_counts, key=color_counts.get)
+            hex_color = f'{int(dominant[0]*255):02x}{int(dominant[1]*255):02x}{int(dominant[2]*255):02x}'
+            annot_colors[ai] = hex_color
+
     spans = []
-    for annot in annots:
+    for ai, annot in enumerate(annots):
         info = annot.info
         title = info.get('title', '')
         if 'SHX' not in title.upper() and 'AutoCAD' not in title:
@@ -1801,12 +1828,13 @@ def _extract_shx_annotations(page, transform=None):
         else:
             text_rot = 0
 
+        text_color = annot_colors.get(ai, '000000')
         spans.append(dict(
             text=content,
             x1=sx1, y1=sy1, x2=sx2, y2=sy2,
             size=font_size,
             rotation=text_rot,
-            color='000000',
+            color=text_color,
             font='Arial',
             font_flags=0,
         ))
