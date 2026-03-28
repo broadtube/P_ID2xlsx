@@ -658,11 +658,7 @@ def make_shape_xml(shape_id: int, name: str, prst: str,
             xfrm.set('rot', str(shape_rot))
 
     # ジオメトリ：カスタムまたはプリセット
-    if prst == 'flowChartCollate':
-        # バルブ: カスタムジオメトリで向きを制御
-        vertical = (ay2 - ay1) > (ax2 - ax1)  # display bboxが縦長なら上下向き
-        sp_pr.append(make_valve_geom(vertical))
-    elif path_items is not None:
+    if path_items is not None:
         sp_pr.append(make_freeform_geom(path_items, ax1, ay1, ax2, ay2, closePath))
     else:
         prst_geom = SubElement(sp_pr, f'{{{NS_A}}}prstGeom')
@@ -1019,9 +1015,13 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
                 return dict(type='rect', **base)
 
         # バルブ検出: 3直線でボウタイ（X型）を形成
-        # 向きはmake_valve_geom(vertical)で制御（display bboxの縦横比で判定）
+        # flowChartCollateプリセットはデフォルトで縦向き（砂時計型）
+        # 横向きバルブには90°回転を適用
         if _is_valve_pattern(items, rect, page_diag=page_diag):
-            return dict(type='valve', **base)
+            # display bboxで向き判定
+            valve_vertical = (y2 - y1) > (x2 - x1)
+            valve_rot = 0 if valve_vertical else 5400000  # 横向き→90°回転
+            return dict(type='valve', shape_rot=valve_rot, **base)
 
         # 三角形検出: 3直線、3頂点（バルブは4頂点なので除外済み）
         if len(line_items) == 3 and len(items) == 3:
