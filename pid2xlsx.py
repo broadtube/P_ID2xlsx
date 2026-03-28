@@ -1206,16 +1206,15 @@ def extract_text_spans(page, transform=None) -> list:
     return spans
 
 
-def _is_valve_edge_line(drawing, valve_rects):
-    """単一直線がバルブの辺（ボウタイの対角線・枠線）かどうか判定
-    両端点がバルブbbox内にある直線を抑制する"""
+def _is_valve_edge_line(drawing, valve_pair_rects):
+    """三角形ペアバルブの辺（ボウタイの対角線・枠線）を抑制
+    単一パスバルブには適用しない（ステム線を保護）"""
     items = drawing['items']
     if len(items) != 1 or items[0][0] != 'l':
         return False
     p1, p2 = items[0][1], items[0][2]
     tol = 1.0
-    for vx0, vy0, vx1, vy1 in valve_rects:
-        # 両端点がバルブ矩形内（tolerance付き）にあれば抑制
+    for vx0, vy0, vx1, vy1 in valve_pair_rects:
         if (vx0 - tol <= p1.x <= vx1 + tol and vy0 - tol <= p1.y <= vy1 + tol and
             vx0 - tol <= p2.x <= vx1 + tol and vy0 - tol <= p2.y <= vy1 + tol):
             return True
@@ -1308,6 +1307,7 @@ def build_drawing_xml(page, options=None) -> tuple:
     valve_pair_indices = set()
     valve_pair_primary = {}    # idx → (bx0,by0,bx1,by1) 結合ボックス
     valve_pair_secondary = set()  # スキップ対象
+    valve_pair_rects = []  # ペアバルブのbbox（エッジ線抑制用）
     for i in range(len(tri_indices)):
         if tri_indices[i][0] in valve_pair_indices:
             continue
@@ -1339,6 +1339,7 @@ def build_drawing_xml(page, options=None) -> tuple:
             bx1 = max(p[0] for p in all_pts_mb)
             by1 = max(p[1] for p in all_pts_mb)
             valve_rects.append((bx0, by0, bx1, by1))
+            valve_pair_rects.append((bx0, by0, bx1, by1))  # エッジ線抑制用
             # 最初の三角形→結合ボックスでvalve描画、2番目→スキップ
             valve_pair_indices.add(idx1)
             valve_pair_indices.add(idx2)
@@ -1402,17 +1403,26 @@ def build_drawing_xml(page, options=None) -> tuple:
                                 arrow_suppress.add(si)
                 break
 
-    # 塗りつぶし三角形と重複するアウトライン三角形も抑制
-    # （3L filled + 3L unfilled が同位置に重なるパターン）
-    filled_tris = [(i, r, f) for i, r, f in arrow_tris if f]  # has_fill=True
-    unfilled_tris_only = [(i, r) for i, r, f in arrow_tris if not f]
+    # 塗りつぶし三角形と重複するアウトライン（3L or 2L）も抑制
+    filled_tris = [(i, r, f) for i, r, f in arrow_tris if f]
+    # アウトライン候補: 3L unfilled三角形 + 2L unfilled（不完全な三角形アウトライン）
+    unfilled_outlines = [(i, r) for i, r, f in arrow_tris if not f]
+    for idx, d in enumerate(drawings):
+        items = d['items']
+        if len(items) == 2 and all(i[0] == 'l' for i in items) and not d.get('fill'):
+            pts = set()
+            for li in items:
+                pts.add((round(li[1].x,1), round(li[1].y,1)))
+                pts.add((round(li[2].x,1), round(li[2].y,1)))
+            if len(pts) == 3:  # 2線で3頂点 = 不完全三角形
+                unfilled_outlines.append((idx, d['rect']))
     for fi, fr, _ in filled_tris:
         fcx = (fr.x0 + fr.x1) / 2
         fcy = (fr.y0 + fr.y1) / 2
-        for ui, ur in unfilled_tris_only:
+        for ui, ur in unfilled_outlines:
             ucx = (ur.x0 + ur.x1) / 2
             ucy = (ur.y0 + ur.y1) / 2
-            if abs(fcx - ucx) < 2 and abs(fcy - ucy) < 2:
+            if abs(fcx - ucx) < 3 and abs(fcy - ucy) < 3:
                 arrow_suppress.add(ui)
 
     # Pass 1.5: SHXアノテーション位置を収集（アノテーション位置と重なるストロークを除去用）
@@ -1531,7 +1541,7 @@ def build_drawing_xml(page, options=None) -> tuple:
 
 
         # バルブの辺（三角形の一辺）を抑制
-        if _is_valve_edge_line(d, valve_rects):
+        if _is_valve_edge_line(d, valve_pair_rects):
             continue
 
         info = classify_drawing(d, transform, page_diag=page_diag)
