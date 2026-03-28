@@ -1364,11 +1364,11 @@ def build_drawing_xml(page, options=None) -> tuple:
             if len(pts) == 4:  # ボウタイ
                 filled_bowties.append((idx, d['rect'], color_tuple_to_hex(fill)))
 
-    # 三角形（塗りつぶし・非塗りつぶし両方）
+    # 三角形（塗りつぶし・非塗りつぶし、3L/2Lの両方）
     arrow_tris = []  # (idx, rect, has_fill)
     for idx, d in enumerate(drawings):
         items = d['items']
-        if len(items) == 3 and all(i[0] == 'l' for i in items):
+        if len(items) in (2, 3) and all(i[0] == 'l' for i in items):
             pts = set()
             for li in items:
                 pts.add((round(li[1].x, 1), round(li[1].y, 1)))
