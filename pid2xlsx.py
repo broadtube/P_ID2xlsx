@@ -1365,8 +1365,11 @@ def build_drawing_xml(page, options=None) -> tuple:
                 filled_bowties.append((idx, d['rect'], color_tuple_to_hex(fill)))
 
     # 三角形（塗りつぶし・非塗りつぶし、3L/2Lの両方）
+    # バルブペアの三角形は除外（バルブとして処理済み）
     arrow_tris = []  # (idx, rect, has_fill)
     for idx, d in enumerate(drawings):
+        if idx in valve_pair_indices:
+            continue
         items = d['items']
         if len(items) in (2, 3) and all(i[0] == 'l' for i in items):
             pts = set()
