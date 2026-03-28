@@ -1349,8 +1349,8 @@ def build_drawing_xml(page, options=None) -> tuple:
 
     # 1c: フロー矢印ペア検出（filled bowtie + triangle）
     # PDFでは塗りつぶしボウタイ(6L FILL)と三角形(3L)が重なって矢印を形成
-    # ボウタイを抑制し、三角形にfillを引き継ぐ。ステム線（1L）も抑制
-    arrow_suppress = set()  # 抑制するインデックス（ボウタイ+ステム線）
+    # ボウタイを抑制し、三角形にfillを引き継ぐ
+    arrow_suppress = set()  # 抑制するインデックス
     arrow_fill_inherit = {}  # 三角形idx → fill_color を引き継ぐ
     filled_bowties = []  # (idx, rect, fill_color)
     for idx, d in enumerate(drawings):
@@ -1386,21 +1386,6 @@ def build_drawing_xml(page, options=None) -> tuple:
                 arrow_suppress.add(bi)
                 if not t_has_fill:
                     arrow_fill_inherit[ti] = bfill
-                # ステム線（ボウタイと三角形の間の1L単線）も抑制
-                bx0 = min(br.x0, tr.x0) - 1
-                by0 = min(br.y0, tr.y0) - 1
-                bx1 = max(br.x1, tr.x1) + 1
-                by1 = max(br.y1, tr.y1) + 1
-                for si, sd in enumerate(drawings):
-                    if len(sd['items']) == 1 and sd['items'][0][0] == 'l' and sd.get('fill') is None:
-                        sr = sd['rect']
-                        smx = (sr.x0 + sr.x1) / 2
-                        smy = (sr.y0 + sr.y1) / 2
-                        if bx0 <= smx <= bx1 and by0 <= smy <= by1:
-                            sw = sr.x1 - sr.x0
-                            sh = sr.y1 - sr.y0
-                            if max(sw, sh) < 15:
-                                arrow_suppress.add(si)
                 break
 
     # 塗りつぶし三角形と重複するアウトライン（3L or 2L）も抑制
@@ -1514,7 +1499,7 @@ def build_drawing_xml(page, options=None) -> tuple:
             skipped_outlines += 1
             continue
 
-        # フロー矢印のボウタイ・ステム線を抑制（三角形にfillを引き継ぐ）
+        # フロー矢印のボウタイを抑制（三角形にfillを引き継ぐ）
         if draw_idx in arrow_suppress:
             continue
 
