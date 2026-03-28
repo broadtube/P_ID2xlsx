@@ -1338,6 +1338,30 @@ def build_drawing_xml(page, options=None) -> tuple:
         for mx0, my0, mx1, my1 in merged:
             shx_annot_rects.append((mx0 - 3, my0 - 3, mx1 + 3, my1 + 3))
 
+        # テキスト高さ付きアノテーション矩形（個別、マージなし）
+        # ストロークがテキスト文字高以下かを判定するため
+        # char_h = アノテーション矩形の短辺 ≈ フォントサイズ
+        # 過大なアノテーション（長辺 > 短辺 * 文字数 * 1.5）は除外
+        # （GROUP見出し等の巨大矩形が図面要素を誤除去するのを防止）
+        shx_annot_rects_with_height = []
+        for annot in (page.annots() or []):
+            if annot.type[0] == 4:
+                content = annot.info.get('content', '').strip()
+                if content:
+                    r = annot.rect
+                    w = r.x1 - r.x0
+                    h = r.y1 - r.y0
+                    char_h = min(w, h)  # 短辺 ≈ テキスト高さ
+                    long_dim = max(w, h)
+                    # テキスト内容に対して妥当なサイズか（1文字≈char_h幅）
+                    expected_len = char_h * len(content) * 1.0
+                    if long_dim > expected_len * 2.0:
+                        continue  # 過大なアノテーション矩形はスキップ
+                    # 3pt余裕で拡大
+                    shx_annot_rects_with_height.append(
+                        (r.x0 - 3, r.y0 - 3, r.x1 + 3, r.y1 + 3, char_h))
+    else:
+        shx_annot_rects_with_height = []
 
     shape_id = 2
     count = 0
@@ -1357,37 +1381,22 @@ def build_drawing_xml(page, options=None) -> tuple:
             continue
 
         # SHXアノテーション位置と重なるストロークを除去
-        # （密度フィルタで漏れた短いテキストストロークをカバー）
+        # 原理: アノテーション矩形内の直線ストロークはSHXテキストベクトルである
         # 保護対象: 塗りつぶし図形（矢印等）、曲線を含む描画（円・ポンプ等）
-        # SHXテキストストロークは全て直線のみ
+        # SHXテキストストロークは全て直線のみ・塗りなし
         has_curves = any(i[0] == 'c' for i in d['items'])
-        if shx_annot_rects and d.get('fill') is None and not has_curves:
+        if shx_annot_rects_with_height and d.get('fill') is None and not has_curves:
             rect = d['rect']
             is_shx_overlap = False
-            rw = rect.x1 - rect.x0
-            rh = rect.y1 - rect.y0
-            # 零幅/零高の極小直線: 中点がアノテーション内にあれば除去
-            # SHXストローク断片は3-5pt程度。長い直線（配管・ハッチング等）は保護
-            if (rw < 0.1 or rh < 0.1) and max(rw, rh) < 4:
-                mid_x = (rect.x0 + rect.x1) / 2
-                mid_y = (rect.y0 + rect.y1) / 2
-                for ax0, ay0, ax1, ay1 in shx_annot_rects:
-                    if ax0 <= mid_x <= ax1 and ay0 <= mid_y <= ay1:
+            mid_x = (rect.x0 + rect.x1) / 2
+            mid_y = (rect.y0 + rect.y1) / 2
+            max_dim = max(rect.x1 - rect.x0, rect.y1 - rect.y0)
+            for ax0, ay0, ax1, ay1, char_h in shx_annot_rects_with_height:
+                if ax0 <= mid_x <= ax1 and ay0 <= mid_y <= ay1:
+                    # ストロークの最大寸法がテキスト高さ以下ならテキストベクトル
+                    if max_dim <= char_h * 1.2:
                         is_shx_overlap = True
                         break
-            else:
-                for ax0, ay0, ax1, ay1 in shx_annot_rects:
-                    # 描画bboxがアノテーション内に30%以上含まれるか
-                    ox0 = max(rect.x0, ax0)
-                    oy0 = max(rect.y0, ay0)
-                    ox1 = min(rect.x1, ax1)
-                    oy1 = min(rect.y1, ay1)
-                    if ox0 < ox1 and oy0 < oy1:
-                        draw_area = max(rw * rh, 0.01)
-                        overlap = (ox1 - ox0) * (oy1 - oy0)
-                        if overlap / draw_area > 0.3:
-                            is_shx_overlap = True
-                            break
             if is_shx_overlap:
                 skipped_outlines += 1
                 continue
