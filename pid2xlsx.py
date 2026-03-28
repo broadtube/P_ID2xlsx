@@ -1346,12 +1346,12 @@ def build_drawing_xml(page, options=None) -> tuple:
             valve_pair_secondary.add(idx2)  # スキップ対象
             break
 
-    # 1c: フロー矢印ペア検出（filled bowtie + unfilled triangle）
-    # PDFでは塗りつぶしボウタイ(6L/4pt FILL)とアウトライン三角形(3L/3pt)が重なって矢印を形成
-    # ボウタイを抑制し、三角形にfillを引き継ぐ
-    arrow_bowtie_suppress = set()  # 抑制する塗りつぶしボウタイのインデックス
+    # 1c: フロー矢印ペア検出（filled bowtie + triangle）
+    # PDFでは塗りつぶしボウタイ(6L FILL)と三角形(3L)が重なって矢印を形成
+    # ボウタイを抑制し、三角形にfillを引き継ぐ。ステム線（1L）も抑制
+    arrow_suppress = set()  # 抑制するインデックス（ボウタイ+ステム線）
     arrow_fill_inherit = {}  # 三角形idx → fill_color を引き継ぐ
-    filled_bowties = []  # (idx, cx_mb, cy_mb, fill_color)
+    filled_bowties = []  # (idx, rect, fill_color)
     for idx, d in enumerate(drawings):
         items = d['items']
         fill = d.get('fill')
@@ -1361,31 +1361,45 @@ def build_drawing_xml(page, options=None) -> tuple:
                 pts.add((round(li[1].x, 1), round(li[1].y, 1)))
                 pts.add((round(li[2].x, 1), round(li[2].y, 1)))
             if len(pts) == 4:  # ボウタイ
-                rect = d['rect']
-                cx = (rect.x0 + rect.x1) / 2
-                cy = (rect.y0 + rect.y1) / 2
-                filled_bowties.append((idx, cx, cy, color_tuple_to_hex(fill)))
+                filled_bowties.append((idx, d['rect'], color_tuple_to_hex(fill)))
 
-    unfilled_tris = []  # (idx, cx_mb, cy_mb)
+    # 三角形（塗りつぶし・非塗りつぶし両方）
+    arrow_tris = []  # (idx, rect, has_fill)
     for idx, d in enumerate(drawings):
         items = d['items']
-        fill = d.get('fill')
-        if not fill and len(items) == 3 and all(i[0] == 'l' for i in items):
+        if len(items) == 3 and all(i[0] == 'l' for i in items):
             pts = set()
             for li in items:
                 pts.add((round(li[1].x, 1), round(li[1].y, 1)))
                 pts.add((round(li[2].x, 1), round(li[2].y, 1)))
             if len(pts) == 3:
-                rect = d['rect']
-                cx = (rect.x0 + rect.x1) / 2
-                cy = (rect.y0 + rect.y1) / 2
-                unfilled_tris.append((idx, cx, cy))
+                arrow_tris.append((idx, d['rect'], d.get('fill') is not None))
 
-    for bi, bcx, bcy, bfill in filled_bowties:
-        for ti, tcx, tcy in unfilled_tris:
-            if abs(bcx - tcx) < 3 and abs(bcy - tcy) < 3:
-                arrow_bowtie_suppress.add(bi)
-                arrow_fill_inherit[ti] = bfill
+    for bi, br, bfill in filled_bowties:
+        bcx = (br.x0 + br.x1) / 2
+        bcy = (br.y0 + br.y1) / 2
+        for ti, tr, t_has_fill in arrow_tris:
+            tcx = (tr.x0 + tr.x1) / 2
+            tcy = (tr.y0 + tr.y1) / 2
+            if abs(bcx - tcx) < 6 and abs(bcy - tcy) < 6:
+                arrow_suppress.add(bi)
+                if not t_has_fill:
+                    arrow_fill_inherit[ti] = bfill
+                # ステム線（ボウタイと三角形の間の1L単線）も抑制
+                bx0 = min(br.x0, tr.x0) - 1
+                by0 = min(br.y0, tr.y0) - 1
+                bx1 = max(br.x1, tr.x1) + 1
+                by1 = max(br.y1, tr.y1) + 1
+                for si, sd in enumerate(drawings):
+                    if len(sd['items']) == 1 and sd['items'][0][0] == 'l' and sd.get('fill') is None:
+                        sr = sd['rect']
+                        smx = (sr.x0 + sr.x1) / 2
+                        smy = (sr.y0 + sr.y1) / 2
+                        if bx0 <= smx <= bx1 and by0 <= smy <= by1:
+                            sw = sr.x1 - sr.x0
+                            sh = sr.y1 - sr.y0
+                            if max(sw, sh) < 15:  # 短い線のみ
+                                arrow_suppress.add(si)
                 break
 
     # Pass 1.5: SHXアノテーション位置を収集（アノテーション位置と重なるストロークを除去用）
@@ -1477,8 +1491,8 @@ def build_drawing_xml(page, options=None) -> tuple:
             skipped_outlines += 1
             continue
 
-        # フロー矢印のボウタイ部分を抑制（三角形にfillを引き継ぐ）
-        if draw_idx in arrow_bowtie_suppress:
+        # フロー矢印のボウタイ・ステム線を抑制（三角形にfillを引き継ぐ）
+        if draw_idx in arrow_suppress:
             continue
 
         # SHXアノテーション位置と重なるストロークを除去
