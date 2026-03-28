@@ -997,6 +997,30 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
         if w > 0 and h > 0:
             return dict(type='ellipse', **base)
 
+    # 2曲線のV字形状 → アクチュエータ三角形として検出
+    # AutoCADのゲートバルブアクチュエータ: 2つの曲線が3頂点のV字を形成
+    if len(curve_items) == 2 and len(items) == 2:
+        # 曲線の端点からV字の3頂点を取得
+        c1_start = curve_items[0][1]  # 最初の曲線の始点
+        c1_end = curve_items[0][4]    # 最初の曲線の終点
+        c2_start = curve_items[1][1]
+        c2_end = curve_items[1][4]
+        # 共有頂点（V字の頂点）を探す
+        chevron_pts = set()
+        for p in [c1_start, c1_end, c2_start, c2_end]:
+            chevron_pts.add((round(p.x, 1), round(p.y, 1)))
+        if len(chevron_pts) == 3:
+            cpts = list(chevron_pts)
+            if transform:
+                tpts = [transform(p[0], p[1]) for p in cpts]
+            else:
+                tpts = cpts
+            tri_rot = _triangle_rotation(tpts)
+            return dict(type='triangle', shape_rot=tri_rot,
+                        x1=x1, y1=y1, x2=x2, y2=y2,
+                        line_color=line_color, fill_color=line_color,
+                        line_width=line_width_emu)
+
     # ベジェ曲線を含むパス → カスタムジオメトリ（円+直線の混合含む）
     if curve_items:
         t_items = transform_items(items, transform) if transform else items
