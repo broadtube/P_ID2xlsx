@@ -1207,26 +1207,18 @@ def extract_text_spans(page, transform=None) -> list:
 
 
 def _is_valve_edge_line(drawing, valve_rects):
-    """単一直線がバルブの辺（三角形の一辺）かどうか判定
-    バルブbboxの一辺に沿った垂直/水平線のみ抑制する"""
+    """単一直線がバルブの辺（ボウタイの対角線・枠線）かどうか判定
+    両端点がバルブbbox内にある直線を抑制する"""
     items = drawing['items']
     if len(items) != 1 or items[0][0] != 'l':
         return False
     p1, p2 = items[0][1], items[0][2]
-    tol = 0.5
+    tol = 1.0
     for vx0, vy0, vx1, vy1 in valve_rects:
-        # 垂直線: x座標がバルブの左辺or右辺と一致し、y範囲がバルブ内
-        if abs(p1.x - p2.x) < tol:
-            if (abs(p1.x - vx0) < tol or abs(p1.x - vx1) < tol):
-                y_min, y_max = min(p1.y, p2.y), max(p1.y, p2.y)
-                if abs(y_min - vy0) < tol and abs(y_max - vy1) < tol:
-                    return True
-        # 水平線: y座標がバルブの上辺or下辺と一致し、x範囲がバルブ内
-        if abs(p1.y - p2.y) < tol:
-            if (abs(p1.y - vy0) < tol or abs(p1.y - vy1) < tol):
-                x_min, x_max = min(p1.x, p2.x), max(p1.x, p2.x)
-                if abs(x_min - vx0) < tol and abs(x_max - vx1) < tol:
-                    return True
+        # 両端点がバルブ矩形内（tolerance付き）にあれば抑制
+        if (vx0 - tol <= p1.x <= vx1 + tol and vy0 - tol <= p1.y <= vy1 + tol and
+            vx0 - tol <= p2.x <= vx1 + tol and vy0 - tol <= p2.y <= vy1 + tol):
+            return True
     return False
 
 
@@ -1339,11 +1331,13 @@ def build_drawing_xml(page, options=None) -> tuple:
             max_dim = max(w1, h1, w2, h2)
             if dist > max_dim * 1.5:
                 continue
-            # ペアのバウンディングボックスを記録
-            bx0 = min(r1.x0, r2.x0)
-            by0 = min(r1.y0, r2.y0)
-            bx1 = max(r1.x1, r2.x1)
-            by1 = max(r1.y1, r2.y1)
+            # 全頂点のmediabox座標からバウンディングボックスを計算
+            # （パスrectはページ回転時に頂点位置とずれるため）
+            all_pts_mb = list(pts1 | pts2)  # mediabox座標の全頂点
+            bx0 = min(p[0] for p in all_pts_mb)
+            by0 = min(p[1] for p in all_pts_mb)
+            bx1 = max(p[0] for p in all_pts_mb)
+            by1 = max(p[1] for p in all_pts_mb)
             valve_rects.append((bx0, by0, bx1, by1))
             # 最初の三角形→結合ボックスでvalve描画、2番目→スキップ
             valve_pair_indices.add(idx1)
