@@ -1285,11 +1285,67 @@ def build_drawing_xml(page, options=None) -> tuple:
     max_shapes = options.get('max_shapes', 0)
 
     # Pass 1: バルブを検出してbounding box（mediabox座標）を記録
+    # 1a: 単一パスのボウタイ（3直線、4端点）
     valve_rects = []
-    for d in drawings:
+    valve_drawing_indices = set()
+    for idx, d in enumerate(drawings):
         if _is_valve_pattern(d['items'], d['rect'], page_diag=page_diag):
             rect = d['rect']
             valve_rects.append((rect.x0, rect.y0, rect.x1, rect.y1))
+            valve_drawing_indices.add(idx)
+
+    # 1b: 三角形ペアのボウタイ（隣接する2つの三角形が共有頂点1つで結合）
+    # AutoCADはバルブを2つの三角形として描画することがある
+    tri_indices = []  # (index, pts_set, rect)
+    for idx, d in enumerate(drawings):
+        if idx in valve_drawing_indices:
+            continue
+        items = d['items']
+        line_items = [i for i in items if i[0] == 'l']
+        if len(line_items) == 3 and len(items) == 3:
+            pts = set()
+            for li in line_items:
+                pts.add((round(li[1].x, 1), round(li[1].y, 1)))
+                pts.add((round(li[2].x, 1), round(li[2].y, 1)))
+            if len(pts) == 3:
+                rect = d['rect']
+                w, h = rect.width, rect.height
+                if max(w, h) >= 5:
+                    tri_indices.append((idx, pts, rect))
+
+    valve_pair_indices = set()
+    for i in range(len(tri_indices)):
+        if tri_indices[i][0] in valve_pair_indices:
+            continue
+        for j in range(i + 1, len(tri_indices)):
+            if tri_indices[j][0] in valve_pair_indices:
+                continue
+            idx1, pts1, r1 = tri_indices[i]
+            idx2, pts2, r2 = tri_indices[j]
+            shared = pts1 & pts2
+            if len(shared) != 1:
+                continue
+            # サイズが近い（±30%）
+            w1, h1 = r1.width, r1.height
+            w2, h2 = r2.width, r2.height
+            if abs(max(w1,h1) - max(w2,h2)) > max(w1,h1,w2,h2) * 0.3:
+                continue
+            # 近接（中心間距離が最大寸法×1.5以下）
+            cx1, cy1 = (r1.x0+r1.x1)/2, (r1.y0+r1.y1)/2
+            cx2, cy2 = (r2.x0+r2.x1)/2, (r2.y0+r2.y1)/2
+            dist = ((cx1-cx2)**2 + (cy1-cy2)**2)**0.5
+            max_dim = max(w1, h1, w2, h2)
+            if dist > max_dim * 1.5:
+                continue
+            # ペアのバウンディングボックスを記録
+            bx0 = min(r1.x0, r2.x0)
+            by0 = min(r1.y0, r2.y0)
+            bx1 = max(r1.x1, r2.x1)
+            by1 = max(r1.y1, r2.y1)
+            valve_rects.append((bx0, by0, bx1, by1))
+            valve_pair_indices.add(idx1)
+            valve_pair_indices.add(idx2)
+            break
 
     # Pass 1.5: SHXアノテーション位置を収集（アノテーション位置と重なるストロークを除去用）
     shx_annot_rects = []
@@ -1368,7 +1424,7 @@ def build_drawing_xml(page, options=None) -> tuple:
     skipped_outlines = 0
 
     # Pass 2: 図形変換（バルブ辺の単一直線を抑制、テキストアウトラインをフィルタ）
-    for d in drawings:
+    for draw_idx, d in enumerate(drawings):
         # 最大シェイプ数チェック
         if max_shapes > 0 and count >= max_shapes:
             print(f"  WARNING: 最大シェイプ数 {max_shapes} に到達、残りをスキップ")
@@ -1409,6 +1465,12 @@ def build_drawing_xml(page, options=None) -> tuple:
         info = classify_drawing(d, transform, page_diag=page_diag)
         if info is None:
             continue
+
+        # 三角形ペアバルブ: 三角形をvalveタイプに変更（flowChartCollateで描画）
+        if draw_idx in valve_pair_indices and info.get('type') == 'triangle':
+            info['type'] = 'valve'
+            valve_vertical = (info['y2'] - info['y1']) > (info['x2'] - info['x1'])
+            info['shape_rot'] = 0 if valve_vertical else 5400000
 
         # オプション: ドット（ゼロ長線）を無視
         if options.get('no_dots') and info.get('type') == 'dot':
