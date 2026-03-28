@@ -1346,6 +1346,48 @@ def build_drawing_xml(page, options=None) -> tuple:
             valve_pair_secondary.add(idx2)  # スキップ対象
             break
 
+    # 1c: フロー矢印ペア検出（filled bowtie + unfilled triangle）
+    # PDFでは塗りつぶしボウタイ(6L/4pt FILL)とアウトライン三角形(3L/3pt)が重なって矢印を形成
+    # ボウタイを抑制し、三角形にfillを引き継ぐ
+    arrow_bowtie_suppress = set()  # 抑制する塗りつぶしボウタイのインデックス
+    arrow_fill_inherit = {}  # 三角形idx → fill_color を引き継ぐ
+    filled_bowties = []  # (idx, cx_mb, cy_mb, fill_color)
+    for idx, d in enumerate(drawings):
+        items = d['items']
+        fill = d.get('fill')
+        if fill and len(items) == 6 and all(i[0] == 'l' for i in items):
+            pts = set()
+            for li in items:
+                pts.add((round(li[1].x, 1), round(li[1].y, 1)))
+                pts.add((round(li[2].x, 1), round(li[2].y, 1)))
+            if len(pts) == 4:  # ボウタイ
+                rect = d['rect']
+                cx = (rect.x0 + rect.x1) / 2
+                cy = (rect.y0 + rect.y1) / 2
+                filled_bowties.append((idx, cx, cy, color_tuple_to_hex(fill)))
+
+    unfilled_tris = []  # (idx, cx_mb, cy_mb)
+    for idx, d in enumerate(drawings):
+        items = d['items']
+        fill = d.get('fill')
+        if not fill and len(items) == 3 and all(i[0] == 'l' for i in items):
+            pts = set()
+            for li in items:
+                pts.add((round(li[1].x, 1), round(li[1].y, 1)))
+                pts.add((round(li[2].x, 1), round(li[2].y, 1)))
+            if len(pts) == 3:
+                rect = d['rect']
+                cx = (rect.x0 + rect.x1) / 2
+                cy = (rect.y0 + rect.y1) / 2
+                unfilled_tris.append((idx, cx, cy))
+
+    for bi, bcx, bcy, bfill in filled_bowties:
+        for ti, tcx, tcy in unfilled_tris:
+            if abs(bcx - tcx) < 3 and abs(bcy - tcy) < 3:
+                arrow_bowtie_suppress.add(bi)
+                arrow_fill_inherit[ti] = bfill
+                break
+
     # Pass 1.5: SHXアノテーション位置を収集（アノテーション位置と重なるストロークを除去用）
     shx_annot_rects = []
     if text_outline_mode and not options.get('no_shx_annot'):
@@ -1435,6 +1477,10 @@ def build_drawing_xml(page, options=None) -> tuple:
             skipped_outlines += 1
             continue
 
+        # フロー矢印のボウタイ部分を抑制（三角形にfillを引き継ぐ）
+        if draw_idx in arrow_bowtie_suppress:
+            continue
+
         # SHXアノテーション位置と重なるストロークを除去
         # 原理: アノテーション矩形内の直線ストロークはSHXテキストベクトルである
         # 保護対象: 塗りつぶし図形（矢印等）、曲線を含む描画（円・ポンプ等）
@@ -1464,6 +1510,10 @@ def build_drawing_xml(page, options=None) -> tuple:
         info = classify_drawing(d, transform, page_diag=page_diag)
         if info is None:
             continue
+
+        # フロー矢印: 重複ボウタイのfillを三角形に引き継ぐ
+        if draw_idx in arrow_fill_inherit and info.get('type') == 'triangle':
+            info['fill_color'] = arrow_fill_inherit[draw_idx]
 
         # 三角形ペアバルブ: 2番目の三角形はスキップ
         if draw_idx in valve_pair_secondary:
