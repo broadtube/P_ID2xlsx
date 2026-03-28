@@ -997,6 +997,30 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
         if w > 0 and h > 0:
             return dict(type='ellipse', **base)
 
+    # 2曲線V字形状 → アクチュエータ三角形（バルブ上の操作記号）
+    # 条件: 2曲線、3頂点、小サイズ（max<13pt）、扁平（aspect>=3.0）
+    if len(curve_items) == 2 and len(items) == 2:
+        c1s, c1e = curve_items[0][1], curve_items[0][4]
+        c2s, c2e = curve_items[1][1], curve_items[1][4]
+        chevron_pts = set()
+        for p in [c1s, c1e, c2s, c2e]:
+            chevron_pts.add((round(p.x, 1), round(p.y, 1)))
+        w_d = x2 - x1
+        h_d = y2 - y1
+        max_dim = max(w_d, h_d)
+        aspect = max_dim / max(min(w_d, h_d), 0.1)
+        if len(chevron_pts) == 3 and max_dim < 13 and aspect >= 3.0:
+            cpts = list(chevron_pts)
+            if transform:
+                tpts = [transform(p[0], p[1]) for p in cpts]
+            else:
+                tpts = cpts
+            tri_rot = _triangle_rotation(tpts)
+            return dict(type='triangle', shape_rot=tri_rot,
+                        x1=x1, y1=y1, x2=x2, y2=y2,
+                        line_color=line_color, fill_color=line_color,
+                        line_width=line_width_emu)
+
     # ベジェ曲線を含むパス → カスタムジオメトリ（円+直線の混合含む）
     if curve_items:
         t_items = transform_items(items, transform) if transform else items
