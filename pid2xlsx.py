@@ -1314,6 +1314,8 @@ def build_drawing_xml(page, options=None) -> tuple:
                     tri_indices.append((idx, pts, rect))
 
     valve_pair_indices = set()
+    valve_pair_primary = {}    # idx → (bx0,by0,bx1,by1) 結合ボックス
+    valve_pair_secondary = set()  # スキップ対象
     for i in range(len(tri_indices)):
         if tri_indices[i][0] in valve_pair_indices:
             continue
@@ -1343,8 +1345,11 @@ def build_drawing_xml(page, options=None) -> tuple:
             bx1 = max(r1.x1, r2.x1)
             by1 = max(r1.y1, r2.y1)
             valve_rects.append((bx0, by0, bx1, by1))
+            # 最初の三角形→結合ボックスでvalve描画、2番目→スキップ
             valve_pair_indices.add(idx1)
             valve_pair_indices.add(idx2)
+            valve_pair_primary[idx1] = (bx0, by0, bx1, by1)  # 結合ボックス
+            valve_pair_secondary.add(idx2)  # スキップ対象
             break
 
     # Pass 1.5: SHXアノテーション位置を収集（アノテーション位置と重なるストロークを除去用）
@@ -1466,10 +1471,26 @@ def build_drawing_xml(page, options=None) -> tuple:
         if info is None:
             continue
 
-        # 三角形ペアバルブ: 三角形をvalveタイプに変更（flowChartCollateで描画）
-        if draw_idx in valve_pair_indices and info.get('type') == 'triangle':
+        # 三角形ペアバルブ: 2番目の三角形はスキップ
+        if draw_idx in valve_pair_secondary:
+            continue
+        # 1番目の三角形→結合ボックスでvalve描画
+        if draw_idx in valve_pair_primary:
+            bx0, by0, bx1, by1 = valve_pair_primary[draw_idx]
+            # 結合ボックスを表示座標に変換
+            if transform:
+                tx0, ty0 = transform(bx0, by0)
+                tx1, ty1 = transform(bx1, by1)
+                vx1, vy1 = min(tx0, tx1), min(ty0, ty1)
+                vx2, vy2 = max(tx0, tx1), max(ty0, ty1)
+            else:
+                vx1, vy1, vx2, vy2 = bx0, by0, bx1, by1
             info['type'] = 'valve'
-            valve_vertical = (info['y2'] - info['y1']) > (info['x2'] - info['x1'])
+            info['x1'] = vx1
+            info['y1'] = vy1
+            info['x2'] = vx2
+            info['y2'] = vy2
+            valve_vertical = (vy2 - vy1) > (vx2 - vx1)
             info['shape_rot'] = 0 if valve_vertical else 5400000
 
         # オプション: ドット（ゼロ長線）を無視
