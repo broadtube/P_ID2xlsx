@@ -9,14 +9,14 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 
-def pdf_to_png(pdf_path: str, output_path: str = None, dpi: int = 150):
-    """PDFをPNG画像に変換"""
+def pdf_to_png(pdf_path: str, output_path: str = None, dpi: int = 150, page_num: int = 0):
+    """PDFをPNG画像に変換（page_num: 0-based）"""
     pdf_path = Path(pdf_path)
     if output_path is None:
         output_path = pdf_path.with_name(pdf_path.stem + '_pdf.png')
 
     doc = fitz.open(str(pdf_path))
-    page = doc[0]
+    page = doc[page_num]
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat)
     pix.save(str(output_path))
@@ -111,6 +111,7 @@ def compare_side_by_side(pdf_png: str, xlsx_png: str, output_path: str = None):
 def main():
     pdf_path = sys.argv[1] if len(sys.argv) > 1 else None
     xlsx_path = sys.argv[2] if len(sys.argv) > 2 else None
+    page_num = int(sys.argv[3]) - 1 if len(sys.argv) > 3 else 0  # 1-based → 0-based
 
     if not pdf_path:
         pdfs = list(Path('.').glob('*.pdf'))
@@ -123,11 +124,11 @@ def main():
             xlsx_path = str(xlsxs[0])
 
     if not pdf_path or not xlsx_path:
-        print("使用法: python verify.py <input.pdf> <output.xlsx>")
+        print("使用法: python verify.py <input.pdf> <output.xlsx> [page_num]")
         sys.exit(1)
 
     print("=== PDF → PNG ===")
-    pdf_png = pdf_to_png(pdf_path)
+    pdf_png = pdf_to_png(pdf_path, page_num=page_num)
 
     print("\n=== Excel → PNG ===")
     xlsx_png = xlsx_to_png(xlsx_path)

@@ -389,6 +389,18 @@ def _is_text_outline_path(drawing, threshold, mode='truetype'):
         all_lines = all(i[0] == 'l' for i in items)
         if not all_lines or n_items < 5:
             return False
+        # 連続折れ線（ジグザグ・波線等）はSHXストロークではない
+        # SHXは独立した短い線の集合、折れ線は端点が連続接続
+        if n_items >= 3:
+            continuous = 0
+            for k in range(len(items) - 1):
+                p_end = items[k][2]    # 現在の線の終点
+                p_start = items[k+1][1]  # 次の線の始点
+                if abs(p_end.x - p_start.x) < 0.5 and abs(p_end.y - p_start.y) < 0.5:
+                    continuous += 1
+            if continuous >= n_items - 1:
+                # 全ての線が端点で接続 → 折れ線図形、SHXではない
+                return False
         area = max(w * h, 1)
         density = n_items / area * 1000
         if n_items >= 10:
@@ -973,9 +985,8 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
                 line_color=line_color, fill_color=fill_color, line_width=line_width_emu,
                 dash_preset=dash_preset, line_cap=line_cap, line_join=line_join)
 
-    # 矩形 / ダイヤモンド
+    # 矩形 / ダイヤモンド / 台形（四辺形）
     if any(i[0] in ('re', 'qu') for i in items):
-        # quアイテムがダイヤモンド（45°回転した四角形）かチェック
         qu_items = [i for i in items if i[0] == 'qu']
         if qu_items:
             quad = qu_items[0][1]  # fitz.Quad
@@ -987,6 +998,24 @@ def classify_drawing(drawing: dict, transform=None, page_diag=None) -> dict | No
                              if abs(p2.x - p1.x) > 1.5 and abs(p2.y - p1.y) > 1.5)
             if diag_count >= 3:
                 return dict(type='diamond', **base)
+            # 軸平行でない四辺形（台形・平行四辺形）→ freeformとして描画
+            is_axis_aligned = (
+                abs(quad.ul.x - quad.ll.x) < 1.5 and
+                abs(quad.ur.x - quad.lr.x) < 1.5 and
+                abs(quad.ul.y - quad.ur.y) < 1.5 and
+                abs(quad.ll.y - quad.lr.y) < 1.5
+            )
+            if not is_axis_aligned:
+                import fitz as _fitz
+                # 四辺形の4頂点を直線パスに変換
+                quad_items = [
+                    ('l', _fitz.Point(quad.ul.x, quad.ul.y), _fitz.Point(quad.ur.x, quad.ur.y)),
+                    ('l', _fitz.Point(quad.ur.x, quad.ur.y), _fitz.Point(quad.lr.x, quad.lr.y)),
+                    ('l', _fitz.Point(quad.lr.x, quad.lr.y), _fitz.Point(quad.ll.x, quad.ll.y)),
+                    ('l', _fitz.Point(quad.ll.x, quad.ll.y), _fitz.Point(quad.ul.x, quad.ul.y)),
+                ]
+                t_items = transform_items(quad_items, transform) if transform else quad_items
+                return dict(type='freeform', items=t_items, closePath=True, **base)
         return dict(type='rect', **base)
 
     # 円/楕円（4+ ベジェ曲線、直線なし）
@@ -1287,7 +1316,7 @@ def build_drawing_xml(page, options=None) -> tuple:
 
     # 1b: 三角形ペアのボウタイ（隣接する2つの三角形が共有頂点1つで結合）
     # AutoCADはバルブを2つの三角形として描画することがある
-    tri_indices = []  # (index, pts_set, rect)
+    tri_indices = []  # (index, pts_list, rect)
     for idx, d in enumerate(drawings):
         if idx in valve_drawing_indices:
             continue
@@ -1302,12 +1331,33 @@ def build_drawing_xml(page, options=None) -> tuple:
                 rect = d['rect']
                 w, h = rect.width, rect.height
                 if max(w, h) >= 5:
-                    tri_indices.append((idx, pts, rect))
+                    # 丸めなしの頂点も保持（近接判定用）
+                    pts_raw = []
+                    for li in line_items:
+                        pts_raw.append((li[1].x, li[1].y))
+                        pts_raw.append((li[2].x, li[2].y))
+                    # 重複除去（同一頂点は近接）
+                    unique_raw = []
+                    for p in pts_raw:
+                        if not any(abs(p[0]-q[0]) < 0.5 and abs(p[1]-q[1]) < 0.5 for q in unique_raw):
+                            unique_raw.append(p)
+                    tri_indices.append((idx, unique_raw, rect))
 
     valve_pair_indices = set()
     valve_pair_primary = {}    # idx → (bx0,by0,bx1,by1) 結合ボックス
     valve_pair_secondary = set()  # スキップ対象
     valve_pair_rects = []  # ペアバルブのbbox（エッジ線抑制用）
+
+    def _count_near_matches(pts1, pts2, tol=1.0):
+        """2つの頂点リスト間で近接する頂点ペア数を返す"""
+        count = 0
+        for p1 in pts1:
+            for p2 in pts2:
+                if abs(p1[0]-p2[0]) < tol and abs(p1[1]-p2[1]) < tol:
+                    count += 1
+                    break
+        return count
+
     for i in range(len(tri_indices)):
         if tri_indices[i][0] in valve_pair_indices:
             continue
@@ -1316,8 +1366,9 @@ def build_drawing_xml(page, options=None) -> tuple:
                 continue
             idx1, pts1, r1 = tri_indices[i]
             idx2, pts2, r2 = tri_indices[j]
-            shared = pts1 & pts2
-            if len(shared) != 1:
+            # 近接判定: ちょうど1つの頂点が近い
+            near_count = _count_near_matches(pts1, pts2)
+            if near_count != 1:
                 continue
             # サイズが近い（±30%）
             w1, h1 = r1.width, r1.height
@@ -1332,8 +1383,7 @@ def build_drawing_xml(page, options=None) -> tuple:
             if dist > max_dim * 1.5:
                 continue
             # 全頂点のmediabox座標からバウンディングボックスを計算
-            # （パスrectはページ回転時に頂点位置とずれるため）
-            all_pts_mb = list(pts1 | pts2)  # mediabox座標の全頂点
+            all_pts_mb = pts1 + pts2
             bx0 = min(p[0] for p in all_pts_mb)
             by0 = min(p[1] for p in all_pts_mb)
             bx1 = max(p[0] for p in all_pts_mb)
@@ -2008,11 +2058,19 @@ def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None, options: dict = No
 
     doc = fitz.open(str(pdf_path))
 
+    # ページフィルタリング
+    page_set = options.get('pages') if options else None
+    if page_set:
+        page_indices = [i for i in range(len(doc)) if (i + 1) in page_set]
+        print(f"  ページ指定: {sorted(page_set)} ({len(page_indices)}ページ)")
+    else:
+        page_indices = list(range(len(doc)))
+
     # Step 1: openpyxlでベースのxlsxを作成（セルサイズ設定のみ）
     wb = Workbook()
-    for page_idx in range(len(doc)):
+    for sheet_idx, page_idx in enumerate(page_indices):
         page = doc[page_idx]
-        if page_idx == 0:
+        if sheet_idx == 0:
             ws = wb.active
             ws.title = f"P&ID_{page_idx + 1}"
         else:
@@ -2048,13 +2106,13 @@ def convert_pid_to_xlsx(pdf_path: str, xlsx_path: str = None, options: dict = No
             ws.row_dimensions[row_idx].height = ROW_HEIGHT_PT
 
     wb.save(str(xlsx_path))
-    doc_page_count = len(doc)
+    doc_page_count = len(page_indices)
 
     # Step 2: Drawing XMLを生成してxlsxに注入
     drawing_data = []
-    for page_idx in range(doc_page_count):
+    for page_idx in page_indices:
         page = doc[page_idx]
-        print(f"\nページ {page_idx + 1}/{doc_page_count} "
+        print(f"\nページ {page_idx + 1}/{len(doc)} "
               f"(サイズ: {page.rect.width:.0f}x{page.rect.height:.0f} pt)")
         xml_bytes, count = build_drawing_xml(page, options=options)
         drawing_data.append((xml_bytes, count))
@@ -2200,6 +2258,8 @@ AutoCAD SHXフォントのPDF（テキストがベクトル化されている場
                         help='SHXアノテーションからのテキスト抽出を無効化（OCRを強制使用）')
     parser.add_argument('--lang', default='en',
                         help='OCR言語（カンマ区切り）。例: en,ja（デフォルト: en）')
+    parser.add_argument('--pages', default=None,
+                        help='変換するページ番号（カンマ区切り/範囲指定）。例: 3 or 1,3,5 or 2-5（デフォルト: 全ページ）')
 
     args = parser.parse_args()
 
@@ -2208,6 +2268,19 @@ AutoCAD SHXフォントのPDF（テキストがベクトル化されている場
     if not pdf_path:
         parser.print_help()
         sys.exit(0)
+
+    # --pages パース
+    page_set = None
+    if args.pages:
+        page_set = set()
+        for part in args.pages.split(','):
+            part = part.strip()
+            if '-' in part:
+                start, end = part.split('-', 1)
+                for p in range(int(start), int(end) + 1):
+                    page_set.add(p)
+            else:
+                page_set.add(int(part))
 
     # オプションをdictに変換
     options = {
@@ -2221,6 +2294,7 @@ AutoCAD SHXフォントのPDF（テキストがベクトル化されている場
         'ocr': args.ocr,
         'no_shx_annot': args.no_shx_annot,
         'ocr_lang': [l.strip() for l in args.lang.split(',')],
+        'pages': page_set,
     }
 
     convert_pid_to_xlsx(pdf_path, args.output, options=options)
